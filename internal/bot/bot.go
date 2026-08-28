@@ -441,10 +441,7 @@ func (bt *Bot) cmdConfig(ctx context.Context, page int, target editTarget) {
 		page = pages - 1
 	}
 	start := page * groupsPerPage
-	end := start + groupsPerPage
-	if end > len(groups) {
-		end = len(groups)
-	}
+	end := min(start+groupsPerPage, len(groups))
 
 	cfgs := bt.cfg.List()
 	var rows [][]models.InlineKeyboardButton
