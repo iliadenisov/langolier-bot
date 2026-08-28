@@ -37,6 +37,9 @@ const deleteBatch = 100
 // searchPageDelay paces pagination of the startup own-message scan.
 const searchPageDelay = time.Second
 
+// sessionBucket is the bbolt bucket holding the MTProto session.
+var sessionBucket = []byte("session")
+
 // MarkChannel returns the bot-API marked id for a bare supergroup/channel id.
 func MarkChannel(id int64) int64 { return -channelIDShift - id }
 
@@ -122,7 +125,17 @@ func New(opts Options) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hash store: %w", err)
 	}
-	session := bbolt.NewSessionStorage(opts.DB, "session", []byte("session"))
+	// gotd/contrib's bbolt session storage errors out ("bucket does not exist")
+	// instead of reporting session.ErrNotFound when the bucket is missing, which
+	// breaks the very first start. Pre-create it so an absent session key
+	// resolves to "not found" and the auth flow runs.
+	if err := opts.DB.Update(func(tx *bolt.Tx) error {
+		_, e := tx.CreateBucketIfNotExists(sessionBucket)
+		return e
+	}); err != nil {
+		return nil, fmt.Errorf("session bucket: %w", err)
+	}
+	session := bbolt.NewSessionStorage(opts.DB, "session", sessionBucket)
 	state := bbolt.NewStateStorage(opts.DB)
 
 	lg := logzap.New(opts.Logger.Named("gotd"))
