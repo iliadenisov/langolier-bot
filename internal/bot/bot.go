@@ -96,13 +96,28 @@ func (bt *Bot) AskPhone(ctx context.Context) (string, error) {
 	return bt.ask(ctx, inputPhone, "Enter the account phone number (international format, e.g. +15551234567):")
 }
 
-// AskCode requests the login code from the owner.
+// AskCode requests the login code from the owner. Telegram invalidates a code
+// as soon as it sees the plain number in a message, so the owner is asked to
+// break it up (spaces, dashes, words — anything); every non-digit is stripped
+// before the code is used.
 func (bt *Bot) AskCode(ctx context.Context) (string, error) {
-	code, err := bt.ask(ctx, inputCode, "Enter the login code you received:")
+	code, err := bt.ask(ctx, inputCode,
+		"Enter the login code with the digits broken up so Telegram does not void it — "+
+			"e.g. `1 2 3 4 5` or `1-2-3-4-5`. Everything except the digits is ignored.")
 	if err != nil {
 		return "", err
 	}
-	return strings.ReplaceAll(code, " ", ""), nil
+	return digitsOnly(code), nil
+}
+
+// digitsOnly returns s with every non-ASCII-digit rune removed.
+func digitsOnly(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, s)
 }
 
 // AskPassword requests the 2FA password from the owner.
