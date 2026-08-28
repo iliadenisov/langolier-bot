@@ -1,0 +1,53 @@
+# langolier user client + its AmneziaWG egress sidecar.
+#
+# Deployed as one compose project: `docker compose -p langolier ...`. The bot
+# shares the sidecar's network namespace (network_mode: service:vpn), so all of
+# its traffic — MTProto and the Bot API — egresses through the tunnel.
+#
+# Every deploy-target detail (the sidecar image, credentials, owner id) comes
+# from the environment; nothing host-specific is committed here. The MTProto
+# session and per-chat config live in the named volume `langolier_data`.
+
+name: langolier
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  vpn:
+    image: ${SIDECAR_IMAGE:?set SIDECAR_IMAGE}
+    restart: unless-stopped
+    privileged: true
+    logging: *logging
+    environment:
+      AWG_CONF: ${AWG_CONF:?set AWG_CONF (the AmneziaWG sidecar config)}
+
+  bot:
+    image: langolier-bot:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on: [vpn]
+    # The bot has no network of its own; it lives in the sidecar's netns.
+    network_mode: "service:vpn"
+    logging: *logging
+    environment:
+      DATA_DIR: /data
+      BOT_TOKEN: ${BOT_TOKEN:?set BOT_TOKEN}
+      API_ID: ${API_ID:?set API_ID}
+      API_HASH: ${API_HASH:?set API_HASH}
+      BOT_OWNER_ID: ${BOT_OWNER_ID:?set BOT_OWNER_ID}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  data:
