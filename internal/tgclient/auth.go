@@ -28,6 +28,7 @@ var errSignUpUnsupported = errors.New("tgclient: account sign-up is not supporte
 // relayAuth adapts a Relay to auth.UserAuthenticator.
 type relayAuth struct {
 	relay Relay
+	api   *tg.Client
 }
 
 var _ auth.UserAuthenticator = relayAuth{}
@@ -41,7 +42,20 @@ func (a relayAuth) Code(ctx context.Context, _ *tg.AuthSentCode) (string, error)
 }
 
 func (a relayAuth) Password(ctx context.Context) (string, error) {
-	return a.relay.AskPassword(ctx, "")
+	return a.relay.AskPassword(ctx, a.hint(ctx))
+}
+
+// hint returns the account's 2FA password hint, or "" if it cannot be fetched.
+func (a relayAuth) hint(ctx context.Context) string {
+	if a.api == nil {
+		return ""
+	}
+	p, err := a.api.AccountGetPassword(ctx)
+	if err != nil {
+		return ""
+	}
+	h, _ := p.GetHint()
+	return h
 }
 
 func (a relayAuth) AcceptTermsOfService(context.Context, tg.HelpTermsOfService) error {
