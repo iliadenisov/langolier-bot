@@ -1,0 +1,568 @@
+// Package bot implements the operator-facing service bot: it relays the MTProto
+// authorization prompts to the owner and exposes an inline-keyboard UI for
+// configuring per-chat message TTL and instant-delete patterns.
+package bot
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/go-telegram/bot"
+	"github.com/go-telegram/bot/models"
+	"go.uber.org/zap"
+
+	"langolier-bot/internal/chatcfg"
+	"langolier-bot/internal/cleaner"
+	"langolier-bot/internal/tgclient"
+)
+
+// groupsPerPage is the inline-keyboard page size for the chat picker.
+const groupsPerPage = 8
+
+type inputKind int
+
+const (
+	inputNone inputKind = iota
+	inputPhone
+	inputCode
+	inputPassword
+	inputTTL
+	inputPattern
+)
+
+// Bot is the service bot.
+type Bot struct {
+	b       *bot.Bot
+	log     *zap.Logger
+	ownerID int64
+
+	tgc *tgclient.Client
+	cfg *chatcfg.Store
+	cl  *cleaner.Cleaner
+
+	baseCtx context.Context
+
+	mu        sync.Mutex
+	running   bool
+	pending   inputKind
+	convoChat int64
+	stageText string
+	authReply chan string
+}
+
+// New creates the service bot. Call Attach then Start.
+func New(token string, ownerID int64, log *zap.Logger) (*Bot, error) {
+	if log == nil {
+		log = zap.NewNop()
+	}
+	bt := &Bot{log: log, ownerID: ownerID}
+	b, err := bot.New(token, bot.WithDefaultHandler(bt.onUpdate))
+	if err != nil {
+		return nil, err
+	}
+	bt.b = b
+	return bt, nil
+}
+
+// Attach wires the MTProto client, config store and cleaner into the bot.
+func (bt *Bot) Attach(tgc *tgclient.Client, cfg *chatcfg.Store, cl *cleaner.Cleaner) {
+	bt.tgc = tgc
+	bt.cfg = cfg
+	bt.cl = cl
+}
+
+// Start runs the bot until ctx is cancelled.
+func (bt *Bot) Start(ctx context.Context) {
+	bt.baseCtx = ctx
+	go bt.b.Start(ctx)
+	bt.send("Service bot ready. Send /start to launch the user client.")
+}
+
+// Stop stops the user client if it is running.
+func (bt *Bot) Stop() {
+	if bt.tgc != nil {
+		_ = bt.tgc.Stop()
+	}
+}
+
+// --- tgclient.Relay -------------------------------------------------------------
+
+// AskPhone requests the account phone number from the owner.
+func (bt *Bot) AskPhone(ctx context.Context) (string, error) {
+	return bt.ask(ctx, inputPhone, "Enter the account phone number (international format, e.g. +15551234567):")
+}
+
+// AskCode requests the login code from the owner.
+func (bt *Bot) AskCode(ctx context.Context) (string, error) {
+	code, err := bt.ask(ctx, inputCode, "Enter the login code you received:")
+	if err != nil {
+		return "", err
+	}
+	return strings.ReplaceAll(code, " ", ""), nil
+}
+
+// AskPassword requests the 2FA password from the owner.
+func (bt *Bot) AskPassword(ctx context.Context, hint string) (string, error) {
+	q := "Enter the 2FA password:"
+	if hint != "" {
+		q += " (hint: " + hint + ")"
+	}
+	return bt.ask(ctx, inputPassword, q)
+}
+
+func (bt *Bot) ask(ctx context.Context, kind inputKind, prompt string) (string, error) {
+	bt.mu.Lock()
+	bt.pending = kind
+	bt.authReply = make(chan string, 1)
+	ch := bt.authReply
+	bt.mu.Unlock()
+
+	bt.send(prompt)
+
+	select {
+	case <-ctx.Done():
+		bt.clearPending()
+		return "", ctx.Err()
+	case v := <-ch:
+		bt.clearPending()
+		return v, nil
+	}
+}
+
+func (bt *Bot) clearPending() {
+	bt.mu.Lock()
+	bt.pending = inputNone
+	bt.convoChat = 0
+	bt.stageText = ""
+	bt.authReply = nil
+	bt.mu.Unlock()
+}
+
+// --- update routing ----------------------------------------------------------
+
+func (bt *Bot) onUpdate(ctx context.Context, _ *bot.Bot, update *models.Update) {
+	switch {
+	case update.CallbackQuery != nil:
+		if update.CallbackQuery.From.ID != bt.ownerID {
+			return
+		}
+		bt.onCallback(ctx, update.CallbackQuery)
+	case update.Message != nil && update.Message.From != nil:
+		if update.Message.From.ID != bt.ownerID {
+			return
+		}
+		bt.onMessage(ctx, update.Message)
+	}
+}
+
+func (bt *Bot) onMessage(ctx context.Context, msg *models.Message) {
+	text := strings.TrimSpace(msg.Text)
+
+	bt.mu.Lock()
+	pending := bt.pending
+	convo := bt.convoChat
+	ch := bt.authReply
+	bt.mu.Unlock()
+
+	switch pending {
+	case inputPhone, inputCode, inputPassword:
+		if ch != nil {
+			ch <- text
+		}
+		return
+	case inputTTL:
+		n, err := strconv.Atoi(text)
+		if err != nil || n < 0 {
+			bt.send("Send a non-negative integer number of minutes (0 disables TTL).")
+			return
+		}
+		bt.clearPending()
+		bt.applyTTL(convo, n)
+		return
+	case inputPattern:
+		if text == "" {
+			bt.send("Pattern must not be empty.")
+			return
+		}
+		bt.mu.Lock()
+		bt.stageText = text
+		bt.mu.Unlock()
+		bt.sendMarkup("Match type for "+strconv.Quote(text)+"?", kbd(
+			row(btn("Exact", "patkind:exact"), btn("Prefix", "patkind:prefix")),
+			row(btn("Cancel", "chat:"+strconv.FormatInt(convo, 10))),
+		))
+		return
+	}
+
+	switch text {
+	case "/start":
+		bt.cmdStart()
+	case "/stop":
+		bt.cmdStop()
+	case "/config":
+		bt.cmdConfig(ctx, 0, editTarget{})
+	case "/status":
+		bt.cmdStatus()
+	default:
+		bt.send("Commands: /start /stop /config /status")
+	}
+}
+
+func (bt *Bot) onCallback(ctx context.Context, cq *models.CallbackQuery) {
+	_, _ = bt.b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: cq.ID})
+
+	var msgID int
+	var chatID int64
+	if cq.Message.Message != nil {
+		msgID = cq.Message.Message.ID
+		chatID = cq.Message.Message.Chat.ID
+	}
+
+	data := cq.Data
+	switch {
+	case strings.HasPrefix(data, "cfg:page:"):
+		page, _ := strconv.Atoi(strings.TrimPrefix(data, "cfg:page:"))
+		bt.cmdConfig(ctx, page, editTarget{chatID, msgID})
+	case strings.HasPrefix(data, "chat:"):
+		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "chat:"), 10, 64)
+		bt.showChatMenu(marked, editTarget{chatID, msgID})
+	case strings.HasPrefix(data, "ttl:"):
+		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "ttl:"), 10, 64)
+		bt.mu.Lock()
+		bt.pending = inputTTL
+		bt.convoChat = marked
+		bt.mu.Unlock()
+		bt.send("Send the message TTL in minutes for this chat (0 disables it):")
+	case strings.HasPrefix(data, "ttlclear:"):
+		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "ttlclear:"), 10, 64)
+		bt.applyTTL(marked, 0)
+	case strings.HasPrefix(data, "pat:"):
+		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "pat:"), 10, 64)
+		bt.showPatternMenu(marked, editTarget{chatID, msgID})
+	case strings.HasPrefix(data, "patadd:"):
+		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "patadd:"), 10, 64)
+		bt.mu.Lock()
+		bt.pending = inputPattern
+		bt.convoChat = marked
+		bt.mu.Unlock()
+		bt.send("Send the pattern text:")
+	case strings.HasPrefix(data, "patkind:"):
+		bt.finishPattern(strings.TrimPrefix(data, "patkind:"))
+	case strings.HasPrefix(data, "patdel:"):
+		rest := strings.TrimPrefix(data, "patdel:")
+		parts := strings.SplitN(rest, ":", 2)
+		if len(parts) != 2 {
+			return
+		}
+		marked, _ := strconv.ParseInt(parts[0], 10, 64)
+		idx, _ := strconv.Atoi(parts[1])
+		if err := bt.cfg.RemovePattern(marked, idx); err != nil {
+			bt.send("Remove failed: " + err.Error())
+			return
+		}
+		bt.showPatternMenu(marked, editTarget{chatID, msgID})
+	case strings.HasPrefix(data, "purge:"):
+		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "purge:"), 10, 64)
+		bt.runPurge(marked)
+	case strings.HasPrefix(data, "off:"):
+		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "off:"), 10, 64)
+		if err := bt.cfg.Disable(marked); err != nil {
+			bt.send("Disable failed: " + err.Error())
+			return
+		}
+		bt.cl.DisableChat(marked)
+		bt.send("Chat cleanup disabled.")
+	}
+}
+
+// --- commands --------------------------------------------------------------
+
+func (bt *Bot) cmdStart() {
+	bt.mu.Lock()
+	if bt.running {
+		bt.mu.Unlock()
+		bt.send("User client is already running.")
+		return
+	}
+	bt.mu.Unlock()
+
+	bt.send("Starting the user client. You may be asked for the phone number, login code and 2FA password.")
+	go func() {
+		if err := bt.tgc.Start(bt.baseCtx, bt.onReady); err != nil {
+			bt.send("Start failed: " + err.Error())
+			return
+		}
+		bt.mu.Lock()
+		bt.running = true
+		bt.mu.Unlock()
+		bt.send("User client authorized and running.")
+	}()
+}
+
+func (bt *Bot) onReady(ctx context.Context) {
+	bt.cl.Run(ctx)
+	if _, err := bt.tgc.ResolveGroups(ctx); err != nil {
+		bt.log.Warn("resolve groups on ready", zap.Error(err))
+	}
+	for marked, cfg := range bt.cfg.List() {
+		if cfg.TTLMinutes <= 0 {
+			continue
+		}
+		m := marked
+		go func() {
+			if err := bt.cl.EnableChat(ctx, m); err != nil {
+				bt.log.Warn("enable chat on ready", zap.Int64("chat", m), zap.Error(err))
+			}
+		}()
+	}
+}
+
+func (bt *Bot) cmdStop() {
+	bt.mu.Lock()
+	running := bt.running
+	bt.mu.Unlock()
+	if !running {
+		bt.send("User client is not running.")
+		return
+	}
+	if err := bt.tgc.Stop(); err != nil {
+		bt.send("Stop error: " + err.Error())
+	}
+	bt.cl.Reset()
+	bt.mu.Lock()
+	bt.running = false
+	bt.mu.Unlock()
+	bt.send("User client stopped. Send /start to launch again.")
+}
+
+func (bt *Bot) cmdConfig(ctx context.Context, page int, target editTarget) {
+	bt.mu.Lock()
+	running := bt.running
+	bt.mu.Unlock()
+	if !running {
+		bt.send("Run /start first.")
+		return
+	}
+
+	groups, err := bt.tgc.ResolveGroups(ctx)
+	if err != nil {
+		bt.send("Failed to list chats: " + err.Error())
+		return
+	}
+	if len(groups) == 0 {
+		bt.send("No eligible group chats found.")
+		return
+	}
+
+	pages := (len(groups) + groupsPerPage - 1) / groupsPerPage
+	if page < 0 {
+		page = 0
+	}
+	if page >= pages {
+		page = pages - 1
+	}
+	start := page * groupsPerPage
+	end := start + groupsPerPage
+	if end > len(groups) {
+		end = len(groups)
+	}
+
+	cfgs := bt.cfg.List()
+	var rows [][]models.InlineKeyboardButton
+	for _, g := range groups[start:end] {
+		label := g.Title
+		if cfgs[g.MarkedID].Configured() {
+			label = "• " + label
+		}
+		rows = append(rows, row(btn(label, "chat:"+strconv.FormatInt(g.MarkedID, 10))))
+	}
+	var nav []models.InlineKeyboardButton
+	if page > 0 {
+		nav = append(nav, btn("‹ Prev", "cfg:page:"+strconv.Itoa(page-1)))
+	}
+	if page < pages-1 {
+		nav = append(nav, btn("Next ›", "cfg:page:"+strconv.Itoa(page+1)))
+	}
+	if len(nav) > 0 {
+		rows = append(rows, nav)
+	}
+
+	text := fmt.Sprintf("Select a group to configure (page %d/%d):", page+1, pages)
+	bt.render(target, text, kbd(rows...))
+}
+
+func (bt *Bot) showChatMenu(marked int64, target editTarget) {
+	cfg := bt.cfg.Get(marked)
+	title := bt.groupTitle(marked)
+	text := fmt.Sprintf("%s\nTTL: %s\nInstant-delete patterns: %d",
+		title, ttlText(cfg.TTLMinutes), len(cfg.Patterns))
+	bt.render(target, text, kbd(
+		row(btn("Set TTL", "ttl:"+strconv.FormatInt(marked, 10)), btn("Clear TTL", "ttlclear:"+strconv.FormatInt(marked, 10))),
+		row(btn("Patterns", "pat:"+strconv.FormatInt(marked, 10))),
+		row(btn("Purge now", "purge:"+strconv.FormatInt(marked, 10))),
+		row(btn("Disable chat", "off:"+strconv.FormatInt(marked, 10))),
+		row(btn("‹ Back", "cfg:page:0")),
+	))
+}
+
+func (bt *Bot) showPatternMenu(marked int64, target editTarget) {
+	cfg := bt.cfg.Get(marked)
+	var rows [][]models.InlineKeyboardButton
+	for i, p := range cfg.Patterns {
+		kind := "prefix"
+		if p.Exact {
+			kind = "exact"
+		}
+		rows = append(rows, row(btn(
+			fmt.Sprintf("❌ [%s] %s", kind, p.Value),
+			fmt.Sprintf("patdel:%d:%d", marked, i),
+		)))
+	}
+	rows = append(rows, row(btn("Add pattern", "patadd:"+strconv.FormatInt(marked, 10))))
+	rows = append(rows, row(btn("‹ Back", "chat:"+strconv.FormatInt(marked, 10))))
+	bt.render(target, bt.groupTitle(marked)+"\nInstant-delete patterns:", kbd(rows...))
+}
+
+func (bt *Bot) finishPattern(kind string) {
+	bt.mu.Lock()
+	marked := bt.convoChat
+	value := bt.stageText
+	bt.mu.Unlock()
+	if marked == 0 || value == "" {
+		return
+	}
+	bt.clearPending()
+	if err := bt.cfg.AddPattern(marked, chatcfg.Pattern{Value: value, Exact: kind == "exact"}); err != nil {
+		bt.send("Add pattern failed: " + err.Error())
+		return
+	}
+	bt.send(fmt.Sprintf("Pattern added (%s): %s", kind, value))
+}
+
+func (bt *Bot) applyTTL(marked int64, minutes int) {
+	if err := bt.cfg.SetTTL(marked, minutes); err != nil {
+		bt.send("Set TTL failed: " + err.Error())
+		return
+	}
+	if minutes > 0 {
+		bt.send(fmt.Sprintf("TTL set to %d min for %s. Scanning history…", minutes, bt.groupTitle(marked)))
+		m := marked
+		go func() {
+			if err := bt.cl.EnableChat(bt.baseCtx, m); err != nil {
+				bt.send("History scan failed: " + err.Error())
+				return
+			}
+			bt.send("History scan complete for " + bt.groupTitle(m) + ".")
+		}()
+		return
+	}
+	bt.cl.DisableChat(marked)
+	bt.send("TTL cleared for " + bt.groupTitle(marked) + ".")
+}
+
+func (bt *Bot) runPurge(marked int64) {
+	bt.send("Purging " + bt.groupTitle(marked) + "…")
+	go func() {
+		rep, err := bt.cl.PurgeNow(bt.baseCtx, marked)
+		if err != nil {
+			bt.send("Purge error: " + err.Error())
+			return
+		}
+		bt.send(formatReport("Purge", rep))
+	}()
+}
+
+func (bt *Bot) cmdStatus() {
+	stats := bt.cl.Stats()
+	if len(stats) == 0 {
+		bt.send("No configured chats.")
+		return
+	}
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Title < stats[j].Title })
+	var b strings.Builder
+	b.WriteString("Status:\n")
+	for _, s := range stats {
+		title := s.Title
+		if title == "" {
+			title = strconv.FormatInt(s.MarkedID, 10)
+		}
+		fmt.Fprintf(&b, "• %s — TTL %s, patterns %d, indexed %d, deleted %d\n",
+			title, ttlText(s.TTLMinutes), s.Patterns, s.Indexed, s.Deleted)
+	}
+	bt.send(b.String())
+}
+
+// --- helpers ---------------------------------------------------------------
+
+type editTarget struct {
+	chatID int64
+	msgID  int
+}
+
+func (bt *Bot) render(t editTarget, text string, markup *models.InlineKeyboardMarkup) {
+	if t.msgID != 0 {
+		_, err := bt.b.EditMessageText(bt.baseCtx, &bot.EditMessageTextParams{
+			ChatID:      t.chatID,
+			MessageID:   t.msgID,
+			Text:        text,
+			ReplyMarkup: markup,
+		})
+		if err == nil {
+			return
+		}
+	}
+	bt.sendMarkup(text, markup)
+}
+
+func (bt *Bot) send(text string) {
+	if _, err := bt.b.SendMessage(bt.baseCtx, &bot.SendMessageParams{ChatID: bt.ownerID, Text: text}); err != nil {
+		bt.log.Warn("send message", zap.Error(err))
+	}
+}
+
+func (bt *Bot) sendMarkup(text string, markup *models.InlineKeyboardMarkup) {
+	if _, err := bt.b.SendMessage(bt.baseCtx, &bot.SendMessageParams{
+		ChatID:      bt.ownerID,
+		Text:        text,
+		ReplyMarkup: markup,
+	}); err != nil {
+		bt.log.Warn("send markup", zap.Error(err))
+	}
+}
+
+func (bt *Bot) groupTitle(marked int64) string {
+	if g, ok := bt.tgc.Group(marked); ok && g.Title != "" {
+		return g.Title
+	}
+	return strconv.FormatInt(marked, 10)
+}
+
+func ttlText(minutes int) string {
+	if minutes <= 0 {
+		return "off"
+	}
+	return strconv.Itoa(minutes) + " min"
+}
+
+func formatReport(kind string, rep cleaner.Report) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s of %s: deleted %d, failed %d", kind, rep.Title, rep.Deleted, rep.Failed)
+	for _, l := range rep.Links {
+		b.WriteString("\n" + l)
+	}
+	return b.String()
+}
+
+func kbd(rows ...[]models.InlineKeyboardButton) *models.InlineKeyboardMarkup {
+	return &models.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+func row(b ...models.InlineKeyboardButton) []models.InlineKeyboardButton { return b }
+
+func btn(text, data string) models.InlineKeyboardButton {
+	return models.InlineKeyboardButton{Text: text, CallbackData: data}
+}
