@@ -74,6 +74,9 @@ jobs:
           BOT_OWNER_ID: ${{ vars.BOT_OWNER_ID }}
           LOG_LEVEL: ${{ vars.LOG_LEVEL }}
           VERSION: ${{ github.sha }}
+          TG_DEVICE_MODEL: ${{ vars.TG_DEVICE_MODEL }}
+          TG_APP_VERSION: ${{ vars.TG_APP_VERSION }}
+          TG_SYSTEM_VERSION: ${{ vars.TG_SYSTEM_VERSION }}
         run: |
           docker compose -p langolier --ansi never --progress plain build
           docker compose -p langolier --ansi never up -d --remove-orphans --force-recreate

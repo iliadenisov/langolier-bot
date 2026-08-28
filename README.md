@@ -47,6 +47,9 @@ Only `BOT_OWNER_ID` may talk to the service bot.
 | `API_ID`       | yes      | Telegram app id from <https://my.telegram.org>.            |
 | `API_HASH`     | yes      | Telegram app hash.                                         |
 | `LOG_LEVEL`    | no       | `debug` / `info` / `warn` / `error` (default `info`).      |
+| `TG_DEVICE_MODEL`   | no  | Session title in Telegram → Active Sessions (default `Langolier`). |
+| `TG_APP_VERSION`    | no  | "App version" line there (default: short build SHA).       |
+| `TG_SYSTEM_VERSION` | no  | "System" line there (default `Linux`).                     |
 
 ## Build and run
 

@@ -44,6 +44,10 @@ services:
       API_HASH: ${API_HASH:?set API_HASH}
       BOT_OWNER_ID: ${BOT_OWNER_ID:?set BOT_OWNER_ID}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Optional — shown in Telegram "Active Sessions"; empty -> built-in defaults.
+      TG_DEVICE_MODEL: ${TG_DEVICE_MODEL:-}
+      TG_APP_VERSION: ${TG_APP_VERSION:-}
+      TG_SYSTEM_VERSION: ${TG_SYSTEM_VERSION:-}
     volumes:
       - data:/data
     deploy:

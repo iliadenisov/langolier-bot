@@ -31,6 +31,7 @@ Everything is supplied via the environment; nothing host-specific is in the repo
 | `BOT_OWNER_ID`   | Telegram numeric user id allowed to command the service bot.      |
 | `LOG_LEVEL`      | `debug` / `info` / `warn` / `error` (default `info`).             |
 | `REGISTRY_HOST`  | Optional — set only to enable a `docker login` before the deploy. |
+| `TG_DEVICE_MODEL` / `TG_APP_VERSION` / `TG_SYSTEM_VERSION` | Optional — the strings Telegram shows in Active Sessions. Unset -> built-in defaults. |
 
 ## `AWG_CONF`
 

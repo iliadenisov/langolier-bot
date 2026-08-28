@@ -80,12 +80,18 @@ type DeletedMessagesFunc func(markedID int64, ids []int)
 
 // Options configures New.
 type Options struct {
-	DB         *bolt.DB
-	AppID      int
-	AppHash    string
-	Logger     *zap.Logger
-	Relay      Relay
-	AppVersion string
+	DB      *bolt.DB
+	AppID   int
+	AppHash string
+	Logger  *zap.Logger
+	Relay   Relay
+
+	// DeviceModel, AppVersion and SystemVersion are reported to Telegram on
+	// connect and shown in the account's "Active Sessions" list. Empty fields
+	// fall back to built-in defaults.
+	DeviceModel   string
+	AppVersion    string
+	SystemVersion string
 }
 
 // Client is the running MTProto user client wrapper.
@@ -160,9 +166,11 @@ func New(opts Options) (*Client, error) {
 		UpdateHandler:  c.gaps,
 		Middlewares:    []telegram.Middleware{c.limiter, c.waiter},
 		Device: telegram.DeviceConfig{
-			DeviceModel:   "Langolier",
-			AppVersion:    opts.AppVersion,
-			SystemVersion: "1.0.0",
+			DeviceModel:    orDefault(opts.DeviceModel, "Langolier"),
+			AppVersion:     orDefault(opts.AppVersion, "dev"),
+			SystemVersion:  orDefault(opts.SystemVersion, "Linux"),
+			SystemLangCode: "en",
+			LangCode:       "en",
 		},
 	})
 	c.api = c.tg.API()
@@ -485,6 +493,13 @@ func messagesOf(res tg.MessagesMessagesClass) []tg.MessageClass {
 	default:
 		return nil
 	}
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
 }
 
 func chunkInts(s []int, n int) [][]int {
