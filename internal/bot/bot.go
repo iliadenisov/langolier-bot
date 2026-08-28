@@ -93,7 +93,9 @@ func (bt *Bot) Stop() {
 
 // AskPhone requests the account phone number from the owner.
 func (bt *Bot) AskPhone(ctx context.Context) (string, error) {
-	return bt.ask(ctx, inputPhone, "Enter the account phone number (international format, e.g. +15551234567):")
+	return bt.ask(ctx, inputPhone,
+		"Enter the account phone number (international format, e.g. +15551234567):",
+		"+15551234567")
 }
 
 // AskCode requests the login code from the owner. Telegram invalidates a code
@@ -103,7 +105,8 @@ func (bt *Bot) AskPhone(ctx context.Context) (string, error) {
 func (bt *Bot) AskCode(ctx context.Context) (string, error) {
 	code, err := bt.ask(ctx, inputCode,
 		"Enter the login code with the digits broken up so Telegram does not void it — "+
-			"e.g. `1 2 3 4 5` or `1-2-3-4-5`. Everything except the digits is ignored.")
+			"e.g. `1 2 3 4 5` or `1-2-3-4-5`. Everything except the digits is ignored.",
+		"1 2 3 4 5")
 	if err != nil {
 		return "", err
 	}
@@ -129,17 +132,24 @@ func (bt *Bot) AskPassword(ctx context.Context, hint string) (string, error) {
 		q += " Hint: " + hint + "."
 	}
 	q += " If it is wrong I will just ask again — no need to /start over."
-	return bt.ask(ctx, inputPassword, q)
+	return bt.ask(ctx, inputPassword, q, "password")
 }
 
-func (bt *Bot) ask(ctx context.Context, kind inputKind, prompt string) (string, error) {
+// ask sets the pending-input state, prompts the owner and blocks until the reply
+// arrives or ctx is cancelled. A non-empty placeholder makes the prompt a
+// ForceReply so the client focuses the input box.
+func (bt *Bot) ask(ctx context.Context, kind inputKind, prompt, placeholder string) (string, error) {
 	bt.mu.Lock()
 	bt.pending = kind
 	bt.authReply = make(chan string, 1)
 	ch := bt.authReply
 	bt.mu.Unlock()
 
-	bt.send(prompt)
+	if placeholder != "" {
+		bt.sendForceReply(prompt, placeholder)
+	} else {
+		bt.send(prompt)
+	}
 
 	select {
 	case <-ctx.Done():
@@ -190,6 +200,13 @@ func (bt *Bot) onMessage(ctx context.Context, msg *models.Message) {
 	case inputPhone, inputCode, inputPassword:
 		if ch != nil {
 			ch <- text
+		}
+		// Keep the login code and 2FA password out of the chat history.
+		if pending == inputCode || pending == inputPassword {
+			_, _ = bt.b.DeleteMessage(ctx, &bot.DeleteMessageParams{
+				ChatID:    msg.Chat.ID,
+				MessageID: msg.ID,
+			})
 		}
 		return
 	case inputTTL:
@@ -589,6 +606,21 @@ func (bt *Bot) sendMarkup(text string, markup *models.InlineKeyboardMarkup) {
 		ReplyMarkup: markup,
 	}); err != nil {
 		bt.log.Warn("send markup", zap.Error(err))
+	}
+}
+
+// sendForceReply prompts the owner with a ForceReply keyboard so the client
+// focuses the input box.
+func (bt *Bot) sendForceReply(text, placeholder string) {
+	if _, err := bt.b.SendMessage(bt.baseCtx, &bot.SendMessageParams{
+		ChatID: bt.ownerID,
+		Text:   text,
+		ReplyMarkup: &models.ForceReply{
+			ForceReply:            true,
+			InputFieldPlaceholder: placeholder,
+		},
+	}); err != nil {
+		bt.log.Warn("send force-reply", zap.Error(err))
 	}
 }
 
