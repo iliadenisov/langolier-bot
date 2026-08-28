@@ -227,69 +227,109 @@ func (bt *Bot) onMessage(ctx context.Context, msg *models.Message) {
 	}
 }
 
+// callback is a parsed inline-keyboard callback payload.
+type callback struct {
+	kind   string // page | chat | ttl | ttlclear | pat | patadd | patkind | patdel | purge | off
+	marked int64  // target chat (marked id) for most kinds
+	idx    int    // pattern index for patdel
+	page   int    // page number for page
+	arg    string // "exact" / "prefix" for patkind
+}
+
+// parseCallback decodes a callback data string. It returns ok=false for any
+// payload that is unknown or malformed.
+func parseCallback(data string) (callback, bool) {
+	prefix, rest, ok := strings.Cut(data, ":")
+	if !ok {
+		return callback{}, false
+	}
+	switch prefix {
+	case "cfg":
+		n, ok := strings.CutPrefix(rest, "page:")
+		if !ok {
+			return callback{}, false
+		}
+		p, err := strconv.Atoi(n)
+		if err != nil {
+			return callback{}, false
+		}
+		return callback{kind: "page", page: p}, true
+	case "chat", "ttl", "ttlclear", "pat", "patadd", "purge", "off":
+		m, err := strconv.ParseInt(rest, 10, 64)
+		if err != nil {
+			return callback{}, false
+		}
+		return callback{kind: prefix, marked: m}, true
+	case "patkind":
+		if rest != "exact" && rest != "prefix" {
+			return callback{}, false
+		}
+		return callback{kind: "patkind", arg: rest}, true
+	case "patdel":
+		a, b, ok := strings.Cut(rest, ":")
+		if !ok {
+			return callback{}, false
+		}
+		m, err1 := strconv.ParseInt(a, 10, 64)
+		idx, err2 := strconv.Atoi(b)
+		if err1 != nil || err2 != nil {
+			return callback{}, false
+		}
+		return callback{kind: "patdel", marked: m, idx: idx}, true
+	default:
+		return callback{}, false
+	}
+}
+
 func (bt *Bot) onCallback(ctx context.Context, cq *models.CallbackQuery) {
 	_, _ = bt.b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: cq.ID})
 
-	var msgID int
-	var chatID int64
+	var tgt editTarget
 	if cq.Message.Message != nil {
-		msgID = cq.Message.Message.ID
-		chatID = cq.Message.Message.Chat.ID
+		tgt = editTarget{cq.Message.Message.Chat.ID, cq.Message.Message.ID}
 	}
 
-	data := cq.Data
-	switch {
-	case strings.HasPrefix(data, "cfg:page:"):
-		page, _ := strconv.Atoi(strings.TrimPrefix(data, "cfg:page:"))
-		bt.cmdConfig(ctx, page, editTarget{chatID, msgID})
-	case strings.HasPrefix(data, "chat:"):
-		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "chat:"), 10, 64)
-		bt.showChatMenu(marked, editTarget{chatID, msgID})
-	case strings.HasPrefix(data, "ttl:"):
-		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "ttl:"), 10, 64)
+	a, ok := parseCallback(cq.Data)
+	if !ok {
+		return
+	}
+	switch a.kind {
+	case "page":
+		bt.cmdConfig(ctx, a.page, tgt)
+	case "chat":
+		bt.showChatMenu(a.marked, tgt)
+	case "ttl":
 		bt.mu.Lock()
 		bt.pending = inputTTL
-		bt.convoChat = marked
+		bt.convoChat = a.marked
 		bt.mu.Unlock()
 		bt.send("Send the message TTL in minutes for this chat (0 disables it):")
-	case strings.HasPrefix(data, "ttlclear:"):
-		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "ttlclear:"), 10, 64)
-		bt.applyTTL(marked, 0)
-	case strings.HasPrefix(data, "pat:"):
-		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "pat:"), 10, 64)
-		bt.showPatternMenu(marked, editTarget{chatID, msgID})
-	case strings.HasPrefix(data, "patadd:"):
-		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "patadd:"), 10, 64)
+	case "ttlclear":
+		bt.applyTTL(a.marked, 0)
+	case "pat":
+		bt.showPatternMenu(a.marked, tgt)
+	case "patadd":
 		bt.mu.Lock()
 		bt.pending = inputPattern
-		bt.convoChat = marked
+		bt.convoChat = a.marked
 		bt.mu.Unlock()
 		bt.send("Send the pattern text:")
-	case strings.HasPrefix(data, "patkind:"):
-		bt.finishPattern(strings.TrimPrefix(data, "patkind:"))
-	case strings.HasPrefix(data, "patdel:"):
-		rest := strings.TrimPrefix(data, "patdel:")
-		parts := strings.SplitN(rest, ":", 2)
-		if len(parts) != 2 {
-			return
-		}
-		marked, _ := strconv.ParseInt(parts[0], 10, 64)
-		idx, _ := strconv.Atoi(parts[1])
-		if err := bt.cfg.RemovePattern(marked, idx); err != nil {
+	case "patkind":
+		bt.finishPattern(a.arg)
+	case "patdel":
+		if err := bt.cfg.RemovePattern(a.marked, a.idx); err != nil {
 			bt.send("Remove failed: " + err.Error())
 			return
 		}
-		bt.showPatternMenu(marked, editTarget{chatID, msgID})
-	case strings.HasPrefix(data, "purge:"):
-		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "purge:"), 10, 64)
-		bt.runPurge(marked)
-	case strings.HasPrefix(data, "off:"):
-		marked, _ := strconv.ParseInt(strings.TrimPrefix(data, "off:"), 10, 64)
-		if err := bt.cfg.Disable(marked); err != nil {
+		bt.showPatternMenu(a.marked, tgt)
+	case "purge":
+		bt.runPurge(a.marked)
+	case "off":
+		if err := bt.cfg.Disable(a.marked); err != nil {
 			bt.send("Disable failed: " + err.Error())
 			return
 		}
-		bt.cl.DisableChat(marked)
+		bt.cl.DisableChat(a.marked)
 		bt.send("Chat cleanup disabled.")
 	}
 }
