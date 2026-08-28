@@ -30,6 +30,8 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
     restart: unless-stopped
     depends_on: [vpn]
     # The bot has no network of its own; it lives in the sidecar's netns.

@@ -73,11 +73,13 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           BOT_OWNER_ID: ${{ vars.BOT_OWNER_ID }}
           LOG_LEVEL: ${{ vars.LOG_LEVEL }}
+          VERSION: ${{ github.sha }}
         run: |
-          docker compose -p langolier --ansi never build --progress plain
+          docker compose -p langolier --ansi never --progress plain build
           docker compose -p langolier --ansi never up -d --remove-orphans --force-recreate
 
       - name: Probe
+        working-directory: deploy
         run: bash ./probe.sh langolier
 
       - name: Prune dangling images

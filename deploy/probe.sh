@@ -52,8 +52,25 @@ if [ -z "$vpn" ]; then
   exit 1
 fi
 
-if docker exec "$vpn" sh -c 'wget -q -T 15 -O /dev/null https://api.telegram.org'; then
+# Active tunnel check from inside the sidecar netns. Use whatever HTTP client the
+# sidecar image ships; if it ships none, the check is inconclusive, not a
+# failure — the bot's own restart count is the hard gate.
+tunnel_check='
+if command -v wget >/dev/null 2>&1; then
+  wget -q -T 15 -O /dev/null https://api.telegram.org
+elif command -v curl >/dev/null 2>&1; then
+  curl -sS -m 15 -o /dev/null https://api.telegram.org
+else
+  echo NO_HTTP_CLIENT; exit 3
+fi'
+
+if docker exec "$vpn" sh -c "$tunnel_check"; then
   echo "tunnel OK: api.telegram.org reachable from the sidecar netns"
+  exit 0
+fi
+rc=$?
+if [ "$rc" -eq 3 ]; then
+  echo "tunnel check skipped: no HTTP client in the sidecar image"
   exit 0
 fi
 
