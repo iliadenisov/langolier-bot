@@ -37,6 +37,12 @@ func main() {
 	apiHash := config.MustEnvString("API_HASH")
 	logLevel := config.EnvStringDefault("LOG_LEVEL", "info")
 
+	// Strings shown in Telegram's "Active Sessions" list; overridable without a
+	// rebuild.
+	deviceModel := config.EnvStringDefault("TG_DEVICE_MODEL", "Langolier")
+	appVersion := config.EnvStringDefault("TG_APP_VERSION", shortVersion(version))
+	systemVersion := config.EnvStringDefault("TG_SYSTEM_VERSION", "Linux")
+
 	logger := buildLogger(logLevel)
 	defer func() { _ = logger.Sync() }()
 	logger.Info("starting langolier", zap.String("version", version))
@@ -61,12 +67,14 @@ func main() {
 	}
 
 	tgc, err := tgclient.New(tgclient.Options{
-		DB:         db,
-		AppID:      apiID,
-		AppHash:    apiHash,
-		Logger:     logger.Named("tg"),
-		Relay:      svc,
-		AppVersion: version,
+		DB:            db,
+		AppID:         apiID,
+		AppHash:       apiHash,
+		Logger:        logger.Named("tg"),
+		Relay:         svc,
+		DeviceModel:   deviceModel,
+		AppVersion:    appVersion,
+		SystemVersion: systemVersion,
 	})
 	if err != nil {
 		config.ExitWithError(err)
@@ -82,6 +90,15 @@ func main() {
 	<-ctx.Done()
 	logger.Info("shutting down")
 	svc.Stop()
+}
+
+// shortVersion trims a git SHA to 7 characters for display; shorter values
+// (e.g. "dev") pass through unchanged.
+func shortVersion(v string) string {
+	if len(v) > 7 {
+		return v[:7]
+	}
+	return v
 }
 
 func buildLogger(level string) *zap.Logger {

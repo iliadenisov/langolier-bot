@@ -37,6 +37,9 @@ const deleteBatch = 100
 // searchPageDelay paces pagination of the startup own-message scan.
 const searchPageDelay = time.Second
 
+// sessionBucket is the bbolt bucket holding the MTProto session.
+var sessionBucket = []byte("session")
+
 // MarkChannel returns the bot-API marked id for a bare supergroup/channel id.
 func MarkChannel(id int64) int64 { return -channelIDShift - id }
 
@@ -77,12 +80,18 @@ type DeletedMessagesFunc func(markedID int64, ids []int)
 
 // Options configures New.
 type Options struct {
-	DB         *bolt.DB
-	AppID      int
-	AppHash    string
-	Logger     *zap.Logger
-	Relay      Relay
-	AppVersion string
+	DB      *bolt.DB
+	AppID   int
+	AppHash string
+	Logger  *zap.Logger
+	Relay   Relay
+
+	// DeviceModel, AppVersion and SystemVersion are reported to Telegram on
+	// connect and shown in the account's "Active Sessions" list. Empty fields
+	// fall back to built-in defaults.
+	DeviceModel   string
+	AppVersion    string
+	SystemVersion string
 }
 
 // Client is the running MTProto user client wrapper.
@@ -122,7 +131,17 @@ func New(opts Options) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hash store: %w", err)
 	}
-	session := bbolt.NewSessionStorage(opts.DB, "session", []byte("session"))
+	// gotd/contrib's bbolt session storage errors out ("bucket does not exist")
+	// instead of reporting session.ErrNotFound when the bucket is missing, which
+	// breaks the very first start. Pre-create it so an absent session key
+	// resolves to "not found" and the auth flow runs.
+	if err := opts.DB.Update(func(tx *bolt.Tx) error {
+		_, e := tx.CreateBucketIfNotExists(sessionBucket)
+		return e
+	}); err != nil {
+		return nil, fmt.Errorf("session bucket: %w", err)
+	}
+	session := bbolt.NewSessionStorage(opts.DB, "session", sessionBucket)
 	state := bbolt.NewStateStorage(opts.DB)
 
 	lg := logzap.New(opts.Logger.Named("gotd"))
@@ -147,9 +166,11 @@ func New(opts Options) (*Client, error) {
 		UpdateHandler:  c.gaps,
 		Middlewares:    []telegram.Middleware{c.limiter, c.waiter},
 		Device: telegram.DeviceConfig{
-			DeviceModel:   "Langolier",
-			AppVersion:    opts.AppVersion,
-			SystemVersion: "1.0.0",
+			DeviceModel:    orDefault(opts.DeviceModel, "Langolier"),
+			AppVersion:     orDefault(opts.AppVersion, "dev"),
+			SystemVersion:  orDefault(opts.SystemVersion, "Linux"),
+			SystemLangCode: "en",
+			LangCode:       "en",
 		},
 	})
 	c.api = c.tg.API()
@@ -472,6 +493,13 @@ func messagesOf(res tg.MessagesMessagesClass) []tg.MessageClass {
 	default:
 		return nil
 	}
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
 }
 
 func chunkInts(s []int, n int) [][]int {
