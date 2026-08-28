@@ -262,7 +262,12 @@ func (c *Client) Start(parent context.Context, onReady func(context.Context)) er
 	go func() {
 		done <- c.waiter.Run(ctx, func(ctx context.Context) error {
 			return c.tg.Run(ctx, func(ctx context.Context) error {
-				if err := c.tg.Auth().IfNecessary(ctx, auth.NewFlow(relayAuth{c.relay}, auth.SendCodeOptions{})); err != nil {
+				authr := relayAuth{relay: c.relay, api: c.api}
+				err := c.tg.Auth().IfNecessary(ctx, auth.NewFlow(authr, auth.SendCodeOptions{}))
+				if errors.Is(err, auth.ErrPasswordInvalid) {
+					err = c.retryPassword(ctx, authr)
+				}
+				if err != nil {
 					ready <- err
 					return err
 				}
@@ -300,6 +305,27 @@ func (c *Client) Start(parent context.Context, onReady func(context.Context)) er
 			return err
 		}
 		return errors.New("tgclient: stopped during startup")
+	}
+}
+
+// retryPassword keeps asking the operator for the 2FA password until one is
+// accepted, ctx is cancelled, or a non-password error occurs. It is entered only
+// after the flow reported an invalid password, at which point the phone and code
+// are already accepted and only account.checkPassword has to succeed.
+func (c *Client) retryPassword(ctx context.Context, authr relayAuth) error {
+	hint := authr.hint(ctx)
+	for {
+		pw, err := c.relay.AskPassword(ctx, hint)
+		if err != nil {
+			return err
+		}
+		_, err = c.tg.Auth().Password(ctx, pw)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, auth.ErrPasswordInvalid) {
+			return err
+		}
 	}
 }
 

@@ -120,12 +120,15 @@ func digitsOnly(s string) string {
 	}, s)
 }
 
-// AskPassword requests the 2FA password from the owner.
+// AskPassword requests the 2FA password from the owner. A wrong password is not
+// fatal: the client simply asks again with this same prompt, so the operator
+// keeps replying until it is accepted (no need to restart with /start).
 func (bt *Bot) AskPassword(ctx context.Context, hint string) (string, error) {
-	q := "Enter the 2FA password:"
+	q := "Enter the 2FA password."
 	if hint != "" {
-		q += " (hint: " + hint + ")"
+		q += " Hint: " + hint + "."
 	}
+	q += " If it is wrong I will just ask again — no need to /start over."
 	return bt.ask(ctx, inputPassword, q)
 }
 
@@ -348,7 +351,7 @@ func (bt *Bot) cmdStart() {
 	bt.send("Starting the user client. You may be asked for the phone number, login code and 2FA password.")
 	go func() {
 		if err := bt.tgc.Start(bt.baseCtx, bt.onReady); err != nil {
-			bt.send("Start failed: " + err.Error())
+			bt.send("Start failed: " + err.Error() + "\nSend /start to try again.")
 			return
 		}
 		bt.mu.Lock()
