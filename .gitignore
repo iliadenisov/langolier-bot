@@ -26,3 +26,6 @@
 
 # ...even if they are in subdirectories
 !*/
+
+# Local-only tooling; never committed (overrides the whitelists above).
+.claude/
