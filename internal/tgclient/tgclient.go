@@ -22,6 +22,7 @@ import (
 	"github.com/gotd/td/telegram/query/dialogs"
 	"github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	bolt "go.etcd.io/bbolt"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -94,42 +95,40 @@ type Options struct {
 	SystemVersion string
 }
 
-// Client is the running MTProto user client wrapper.
+// errNotRunning is returned by API calls made while the client is stopped.
+var errNotRunning = errors.New("tgclient: client is not running")
+
+// Client wraps the MTProto user client. The gotd stack (telegram.Client,
+// updates manager, waiter) is single-use, so it is rebuilt on every Start.
 type Client struct {
-	log        *zap.Logger
-	relay      Relay
+	log   *zap.Logger
+	relay Relay
+	opts  Options
+
+	onOwn OwnMessageFunc
+	onDel DeletedMessagesFunc
+
+	mu     sync.Mutex
+	groups map[int64]Group
+	self   *tg.User
+
+	// per-run state, set by buildStack and cleared by reset.
+	running    bool
 	tg         *telegram.Client
 	api        *tg.Client
 	gaps       *updates.Manager
 	dispatcher tg.UpdateDispatcher
 	waiter     *floodwait.Waiter
-	limiter    *ratelimit.RateLimiter
-
-	onOwn OwnMessageFunc
-	onDel DeletedMessagesFunc
-
-	mu      sync.Mutex
-	running bool
-	cancel  context.CancelFunc
-	done    chan error
-	self    *tg.User
-	groups  map[int64]Group
+	cancel     context.CancelFunc
+	done       chan struct{} // closed by the run goroutine on exit
+	runErr     error         // set before done is closed
 }
 
-// New builds the client. It does not connect; call Start.
+// New validates options and prepares the bbolt state. It does not connect; call
+// Start.
 func New(opts Options) (*Client, error) {
 	if opts.Logger == nil {
 		opts.Logger = zap.NewNop()
-	}
-	c := &Client{
-		log:    opts.Logger,
-		relay:  opts.Relay,
-		groups: make(map[int64]Group),
-	}
-
-	hashes, err := newHashStore(opts.DB)
-	if err != nil {
-		return nil, fmt.Errorf("hash store: %w", err)
 	}
 	// gotd/contrib's bbolt session storage errors out ("bucket does not exist")
 	// instead of reporting session.ErrNotFound when the bucket is missing, which
@@ -141,10 +140,25 @@ func New(opts Options) (*Client, error) {
 	}); err != nil {
 		return nil, fmt.Errorf("session bucket: %w", err)
 	}
-	session := bbolt.NewSessionStorage(opts.DB, "session", sessionBucket)
-	state := bbolt.NewStateStorage(opts.DB)
+	return &Client{
+		log:    opts.Logger,
+		relay:  opts.Relay,
+		opts:   opts,
+		groups: make(map[int64]Group),
+	}, nil
+}
 
-	lg := logzap.New(opts.Logger.Named("gotd"))
+// buildStack constructs a fresh gotd stack. Called under c.mu at the start of
+// every Start because telegram.Client and updates.Manager cannot be reused once
+// their Run has returned.
+func (c *Client) buildStack() error {
+	hashes, err := newHashStore(c.opts.DB)
+	if err != nil {
+		return fmt.Errorf("hash store: %w", err)
+	}
+	session := bbolt.NewSessionStorage(c.opts.DB, "session", sessionBucket)
+	state := bbolt.NewStateStorage(c.opts.DB)
+	lg := logzap.New(c.log.Named("gotd"))
 
 	c.dispatcher = tg.NewUpdateDispatcher()
 	c.registerHandlers()
@@ -156,25 +170,51 @@ func New(opts Options) (*Client, error) {
 		UserAccessHasher: hashes,
 		Logger:           lg,
 	})
-
 	c.waiter = floodwait.NewWaiter().WithMaxRetries(5).WithMaxWait(2 * time.Minute)
-	c.limiter = ratelimit.New(rate.Every(time.Second), 3)
 
-	c.tg = telegram.NewClient(opts.AppID, opts.AppHash, telegram.Options{
+	c.tg = telegram.NewClient(c.opts.AppID, c.opts.AppHash, telegram.Options{
 		Logger:         lg,
 		SessionStorage: session,
 		UpdateHandler:  c.gaps,
-		Middlewares:    []telegram.Middleware{c.limiter, c.waiter},
+		Middlewares: []telegram.Middleware{
+			ratelimit.New(rate.Every(time.Second), 3),
+			c.waiter,
+		},
 		Device: telegram.DeviceConfig{
-			DeviceModel:    orDefault(opts.DeviceModel, "Langolier"),
-			AppVersion:     orDefault(opts.AppVersion, "dev"),
-			SystemVersion:  orDefault(opts.SystemVersion, "Linux"),
+			DeviceModel:    orDefault(c.opts.DeviceModel, "Langolier"),
+			AppVersion:     orDefault(c.opts.AppVersion, "dev"),
+			SystemVersion:  orDefault(c.opts.SystemVersion, "Linux"),
 			SystemLangCode: "en",
 			LangCode:       "en",
 		},
 	})
 	c.api = c.tg.API()
-	return c, nil
+	return nil
+}
+
+// reset clears per-run state so the next Start builds a clean stack. runErr is
+// kept: Start / Stop read it via takeRunErr right after reset.
+func (c *Client) reset() {
+	c.mu.Lock()
+	c.running = false
+	c.tg = nil
+	c.api = nil
+	c.gaps = nil
+	c.waiter = nil
+	c.cancel = nil
+	c.done = nil
+	c.mu.Unlock()
+}
+
+// apiRef returns the live API client, or an error when stopped.
+func (c *Client) apiRef() (*tg.Client, error) {
+	c.mu.Lock()
+	api := c.api
+	c.mu.Unlock()
+	if api == nil {
+		return nil, errNotRunning
+	}
+	return api, nil
 }
 
 // OnOwnMessage sets the outgoing-message callback. Call before Start.
@@ -241,37 +281,43 @@ func (c *Client) fireDeleted(marked int64, ids []int) {
 	}
 }
 
-// Start connects, runs the auth flow via the relay when needed, launches the
-// updates manager and blocks in the background. It returns once the client is
-// ready (or with the startup error). onReady, if set, runs in its own goroutine
-// after readiness.
+// authRestartLimit bounds how many times a fresh auth flow is retried after
+// Telegram answers AUTH_RESTART (a stale unfinished login on the account).
+const authRestartLimit = 3
+
+// Start builds a fresh gotd stack, runs the auth flow via the relay when needed,
+// launches the updates manager and blocks it in the background. It returns once
+// the client is ready or with the startup error; on any failure the client is
+// fully reset so a later Start starts clean. onReady, if set, runs in its own
+// goroutine after readiness.
 func (c *Client) Start(parent context.Context, onReady func(context.Context)) error {
 	c.mu.Lock()
 	if c.running {
 		c.mu.Unlock()
 		return errors.New("tgclient: already running")
 	}
+	if err := c.buildStack(); err != nil {
+		c.mu.Unlock()
+		return err
+	}
 	ctx, cancel := context.WithCancel(parent)
 	c.cancel = cancel
 	c.running = true
-	c.done = make(chan error, 1)
+	c.runErr = nil
+	c.done = make(chan struct{})
 	done := c.done
+	tgClient, waiter := c.tg, c.waiter
 	c.mu.Unlock()
 
 	ready := make(chan error, 1)
 	go func() {
-		done <- c.waiter.Run(ctx, func(ctx context.Context) error {
-			return c.tg.Run(ctx, func(ctx context.Context) error {
-				authr := relayAuth{relay: c.relay, api: c.api}
-				err := c.tg.Auth().IfNecessary(ctx, auth.NewFlow(authr, auth.SendCodeOptions{}))
-				if errors.Is(err, auth.ErrPasswordInvalid) {
-					err = c.retryPassword(ctx, authr)
-				}
-				if err != nil {
+		err := waiter.Run(ctx, func(ctx context.Context) error {
+			return tgClient.Run(ctx, func(ctx context.Context) error {
+				if err := c.authorize(ctx); err != nil {
 					ready <- err
 					return err
 				}
-				self, err := c.tg.Self(ctx)
+				self, err := tgClient.Self(ctx)
 				if err != nil {
 					ready <- err
 					return err
@@ -291,16 +337,25 @@ func (c *Client) Start(parent context.Context, onReady func(context.Context)) er
 				return ctx.Err()
 			})
 		})
+		c.mu.Lock()
+		c.runErr = err
+		c.mu.Unlock()
+		close(done)
 	}()
 
 	select {
 	case err := <-ready:
 		if err != nil {
-			c.finish()
+			cancel()
+			<-done
+			c.reset()
+			return err
 		}
-		return err
-	case err := <-done:
-		c.finish()
+		return nil
+	case <-done:
+		cancel()
+		err := c.takeRunErr()
+		c.reset()
 		if err != nil {
 			return err
 		}
@@ -308,11 +363,35 @@ func (c *Client) Start(parent context.Context, onReady func(context.Context)) er
 	}
 }
 
+func (c *Client) takeRunErr() error {
+	c.mu.Lock()
+	err := c.runErr
+	c.mu.Unlock()
+	return err
+}
+
+// authorize runs the user-authorization flow. It retries the whole flow on
+// AUTH_RESTART (the phone is cached, so only the code is re-requested) and hands
+// off to retryPassword when the 2FA password is rejected.
+func (c *Client) authorize(ctx context.Context) error {
+	authr := &relayAuth{relay: c.relay, api: c.api}
+
+	err := c.tg.Auth().IfNecessary(ctx, auth.NewFlow(authr, auth.SendCodeOptions{}))
+	for attempt := 0; attempt < authRestartLimit && tgerr.Is(err, "AUTH_RESTART"); attempt++ {
+		c.log.Warn("auth restarted by Telegram, retrying the flow")
+		err = c.tg.Auth().IfNecessary(ctx, auth.NewFlow(authr, auth.SendCodeOptions{}))
+	}
+	if errors.Is(err, auth.ErrPasswordInvalid) {
+		return c.retryPassword(ctx, authr)
+	}
+	return err
+}
+
 // retryPassword keeps asking the operator for the 2FA password until one is
 // accepted, ctx is cancelled, or a non-password error occurs. It is entered only
 // after the flow reported an invalid password, at which point the phone and code
 // are already accepted and only account.checkPassword has to succeed.
-func (c *Client) retryPassword(ctx context.Context, authr relayAuth) error {
+func (c *Client) retryPassword(ctx context.Context, authr *relayAuth) error {
 	hint := authr.hint(ctx)
 	for {
 		pw, err := c.relay.AskPassword(ctx, hint)
@@ -340,18 +419,13 @@ func (c *Client) Stop() error {
 	c.mu.Unlock()
 
 	cancel()
-	err := <-done
-	c.finish()
+	<-done
+	err := c.takeRunErr()
+	c.reset()
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
 	return err
-}
-
-func (c *Client) finish() {
-	c.mu.Lock()
-	c.running = false
-	c.mu.Unlock()
 }
 
 func (c *Client) setSelf(u *tg.User) {
@@ -370,8 +444,12 @@ func (c *Client) Running() bool {
 // ResolveGroups enumerates the account's dialogs and returns the eligible group
 // chats, refreshing the internal cache used by Group.
 func (c *Client) ResolveGroups(ctx context.Context) ([]Group, error) {
+	api, err := c.apiRef()
+	if err != nil {
+		return nil, err
+	}
 	var groups []Group
-	err := dialogs.NewQueryBuilder(c.api).GetDialogs().BatchSize(100).ForEach(ctx, func(_ context.Context, e dialogs.Elem) error {
+	err = dialogs.NewQueryBuilder(api).GetDialogs().BatchSize(100).ForEach(ctx, func(_ context.Context, e dialogs.Elem) error {
 		g, ok := groupFromElem(e)
 		if !ok {
 			return nil
@@ -435,9 +513,13 @@ func groupFromElem(e dialogs.Elem) (Group, bool) {
 // ScanOwn pages through the account's own messages in g, oldest-first pacing,
 // invoking cb for every message found.
 func (c *Client) ScanOwn(ctx context.Context, g Group, cb func(msgID int, date time.Time)) error {
+	api, err := c.apiRef()
+	if err != nil {
+		return err
+	}
 	offsetID := 0
 	for {
-		res, err := c.api.MessagesSearch(ctx, &tg.MessagesSearchRequest{
+		res, err := api.MessagesSearch(ctx, &tg.MessagesSearchRequest{
 			Peer:     g.inputPeer(),
 			FromID:   &tg.InputPeerSelf{},
 			Filter:   &tg.InputMessagesFilterEmpty{},
@@ -475,15 +557,19 @@ func (c *Client) ScanOwn(ctx context.Context, g Group, cb func(msgID int, date t
 // Delete removes the given message ids from g in batches. It returns the ids
 // whose batch RPC failed, alongside the last error.
 func (c *Client) Delete(ctx context.Context, g Group, ids []int) (failed []int, err error) {
+	api, err := c.apiRef()
+	if err != nil {
+		return nil, err
+	}
 	for _, chunk := range chunkInts(ids, deleteBatch) {
 		var e error
 		if g.IsChannel {
-			_, e = c.api.ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{
+			_, e = api.ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{
 				Channel: g.inputChannel(),
 				ID:      chunk,
 			})
 		} else {
-			_, e = c.api.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{
+			_, e = api.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{
 				Revoke: true,
 				ID:     chunk,
 			})
