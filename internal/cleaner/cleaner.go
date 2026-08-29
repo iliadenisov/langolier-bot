@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -81,6 +82,10 @@ type Cleaner struct {
 	// drainPause is the wait between drainChat passes; a field so tests can
 	// zero it. New sets it to drainPassDelay.
 	drainPause time.Duration
+
+	// startDrain kicks off a background history drain for a chat. A field so
+	// tests can observe it without spawning goroutines. New sets the default.
+	startDrain func(markedID int64)
 }
 
 // New creates a Cleaner.
@@ -88,7 +93,7 @@ func New(tg TG, cfg *chatcfg.Store, log *zap.Logger) *Cleaner {
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &Cleaner{
+	c := &Cleaner{
 		tg:         tg,
 		cfg:        cfg,
 		log:        log,
@@ -96,6 +101,15 @@ func New(tg TG, cfg *chatcfg.Store, log *zap.Logger) *Cleaner {
 		deleted:    make(map[int64]int),
 		drainPause: drainPassDelay,
 	}
+	c.startDrain = func(markedID int64) {
+		go func() {
+			if _, err := c.drainChat(context.Background(), markedID); err != nil {
+				c.log.Warn("reconcile drain failed",
+					zap.Int64("chat", markedID), zap.Error(err))
+			}
+		}()
+	}
+	return c
 }
 
 // Run starts the sweep loop for ctx. It is a no-op if a loop is already running;
@@ -267,6 +281,77 @@ func (c *Cleaner) Reset() {
 	c.index = make(map[int64]map[int]time.Time)
 	c.deleted = make(map[int64]int)
 	c.mu.Unlock()
+}
+
+// ReconcileResult reports the membership changes Reconcile acted on, by chat
+// title.
+type ReconcileResult struct {
+	Lost     []string // cleanup stopped: the account left or was removed
+	Rejoined []string // a history drain was (re)started after a rejoin
+}
+
+// Reconcile compares the chats the account is actually in against the chats the
+// cleaner is watching (a positive TTL configured, or a live index) and acts on
+// the difference:
+//
+//   - a watched, indexed chat that is no longer in the dialog list means the
+//     account left or was removed: its sweep stops and its in-memory index is
+//     dropped, while the TTL and pattern config are kept for a later rejoin;
+//   - a chat the account is back in, still TTL-configured but not yet indexed,
+//     gets a fresh multi-pass history drain.
+//
+// It is safe to call repeatedly; only transitions produce entries in the
+// result.
+func (c *Cleaner) Reconcile(ctx context.Context) (ReconcileResult, error) {
+	groups, err := c.tg.ResolveGroups(ctx)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	present := make(map[int64]struct{}, len(groups))
+	for _, g := range groups {
+		present[g.MarkedID] = struct{}{}
+	}
+
+	watch := make(map[int64]struct{})
+	for marked, cfg := range c.cfg.List() {
+		if cfg.TTLMinutes > 0 {
+			watch[marked] = struct{}{}
+		}
+	}
+	c.mu.Lock()
+	for marked := range c.index {
+		watch[marked] = struct{}{}
+	}
+	c.mu.Unlock()
+
+	var res ReconcileResult
+	for marked := range watch {
+		_, here := present[marked]
+		c.mu.Lock()
+		_, indexed := c.index[marked]
+		c.mu.Unlock()
+
+		switch {
+		case !here && indexed:
+			c.DisableChat(marked)
+			res.Lost = append(res.Lost, c.chatTitle(marked))
+		case here && !indexed && c.cfg.Get(marked).TTL() > 0:
+			c.startDrain(marked)
+			res.Rejoined = append(res.Rejoined, c.chatTitle(marked))
+		}
+	}
+	sort.Strings(res.Lost)
+	sort.Strings(res.Rejoined)
+	return res, nil
+}
+
+// chatTitle returns the cached title for a marked id, or its numeric form when
+// the group is unknown.
+func (c *Cleaner) chatTitle(markedID int64) string {
+	if g, ok := c.tg.Group(markedID); ok && g.Title != "" {
+		return g.Title
+	}
+	return strconv.FormatInt(markedID, 10)
 }
 
 // PurgeNow deletes every reachable own message in the chat older than its TTL,

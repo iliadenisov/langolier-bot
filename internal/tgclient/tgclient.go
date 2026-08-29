@@ -80,6 +80,11 @@ type OwnMessageFunc func(markedID int64, msgID int, date time.Time, text string)
 // the common (basic-group/private) message box, where ids are account-global.
 type DeletedMessagesFunc func(markedID int64, ids []int)
 
+// MembershipFunc is called when something membership-related happens: the
+// account left, was removed from, or (re)joined a chat. It carries no detail;
+// the callee is expected to reconcile against the current dialog list.
+type MembershipFunc func()
+
 // Options configures New.
 type Options struct {
 	DB      *bolt.DB
@@ -106,8 +111,9 @@ type Client struct {
 	relay Relay
 	opts  Options
 
-	onOwn OwnMessageFunc
-	onDel DeletedMessagesFunc
+	onOwn        OwnMessageFunc
+	onDel        DeletedMessagesFunc
+	onMembership MembershipFunc
 
 	mu     sync.Mutex
 	groups map[int64]Group
@@ -173,6 +179,11 @@ func (c *Client) buildStack() error {
 		AccessHasher:     hashes,
 		UserAccessHasher: hashes,
 		Logger:           lg,
+		OnChannelInaccessible: func(channelID int64) {
+			c.log.Info("channel inaccessible, membership reconcile due",
+				zap.Int64("channel_id", channelID))
+			c.fireMembership()
+		},
 	})
 	c.waiter = floodwait.NewWaiter().WithMaxRetries(5).WithMaxWait(2 * time.Minute)
 
@@ -235,6 +246,22 @@ func (c *Client) OnDeletedMessages(fn DeletedMessagesFunc) {
 	c.mu.Unlock()
 }
 
+// OnMembership sets the membership-change callback. Call before Start.
+func (c *Client) OnMembership(fn MembershipFunc) {
+	c.mu.Lock()
+	c.onMembership = fn
+	c.mu.Unlock()
+}
+
+func (c *Client) fireMembership() {
+	c.mu.Lock()
+	fn := c.onMembership
+	c.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
 func (c *Client) registerHandlers() {
 	c.dispatcher.OnNewMessage(func(_ context.Context, _ tg.Entities, u *tg.UpdateNewMessage) error {
 		c.handleNewMessage(u.Message)
@@ -255,6 +282,12 @@ func (c *Client) registerHandlers() {
 }
 
 func (c *Client) handleNewMessage(mc tg.MessageClass) {
+	if svc, ok := mc.(*tg.MessageService); ok {
+		if isMembershipAction(svc.Action) {
+			c.fireMembership()
+		}
+		return
+	}
 	m, ok := mc.(*tg.Message)
 	if !ok || !m.Out {
 		return
@@ -273,6 +306,21 @@ func (c *Client) handleNewMessage(mc tg.MessageClass) {
 	c.mu.Unlock()
 	if fn != nil {
 		fn(marked, m.ID, time.Unix(int64(m.Date), 0), m.Message)
+	}
+}
+
+// isMembershipAction reports whether a service-message action means someone
+// joined or left the chat — a cue that the account's own membership may have
+// changed and a reconcile is due.
+func isMembershipAction(a tg.MessageActionClass) bool {
+	switch a.(type) {
+	case *tg.MessageActionChatDeleteUser,
+		*tg.MessageActionChatAddUser,
+		*tg.MessageActionChatJoinedByLink,
+		*tg.MessageActionChatJoinedByRequest:
+		return true
+	default:
+		return false
 	}
 }
 

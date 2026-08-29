@@ -152,6 +152,33 @@ func TestHandleNewMessage(t *testing.T) {
 	}
 }
 
+func TestHandleNewMessageMembership(t *testing.T) {
+	c := &Client{}
+	fired := 0
+	c.OnMembership(func() { fired++ })
+
+	membership := []tg.MessageActionClass{
+		&tg.MessageActionChatDeleteUser{UserID: 5},
+		&tg.MessageActionChatAddUser{Users: []int64{5}},
+		&tg.MessageActionChatJoinedByLink{},
+		&tg.MessageActionChatJoinedByRequest{},
+	}
+	for _, a := range membership {
+		c.handleNewMessage(&tg.MessageService{Action: a})
+	}
+	if fired != len(membership) {
+		t.Fatalf("membership fired %d times, want %d", fired, len(membership))
+	}
+
+	// Non-membership service messages and regular messages do not poke.
+	fired = 0
+	c.handleNewMessage(&tg.MessageService{Action: &tg.MessageActionPinMessage{}})
+	c.handleNewMessage(&tg.Message{Out: true, ID: 1, PeerID: &tg.PeerChannel{ChannelID: 1}})
+	if fired != 0 {
+		t.Fatalf("membership fired %d times for non-membership updates, want 0", fired)
+	}
+}
+
 func TestChunkInts(t *testing.T) {
 	if chunkInts(nil, 3) != nil || chunkInts([]int{}, 3) != nil {
 		t.Error("empty input must yield nil")
