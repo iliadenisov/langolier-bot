@@ -25,6 +25,7 @@ import (
 	"github.com/gotd/td/tgerr"
 	bolt "go.etcd.io/bbolt"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 )
@@ -158,7 +159,10 @@ func (c *Client) buildStack() error {
 	}
 	session := bbolt.NewSessionStorage(c.opts.DB, "session", sessionBucket)
 	state := bbolt.NewStateStorage(c.opts.DB)
-	lg := logzap.New(c.log.Named("gotd"))
+	// gotd logs connection housekeeping ("Salt updated", "SessionInit",
+	// "Key already exists", …) at Info, which drowns the operator log. Cap the
+	// stack logger at Warn so only warnings and errors from gotd survive.
+	lg := logzap.New(c.log.Named("gotd").WithOptions(zap.IncreaseLevel(zapcore.WarnLevel)))
 
 	c.dispatcher = tg.NewUpdateDispatcher()
 	c.registerHandlers()
@@ -510,42 +514,82 @@ func groupFromElem(e dialogs.Elem) (Group, bool) {
 	}
 }
 
-// ScanOwn pages through the account's own messages in g, oldest-first pacing,
-// invoking cb for every message found.
+// searchPageLimit is the page size of the own-message history scan.
+const searchPageLimit = 100
+
+// ScanOwn walks the account's own messages in g newest-first, paging backwards
+// with messages.search and invoking cb for every message found. It stops when
+// the server returns an empty page or stops advancing the offset. Per-page
+// progress is logged at Debug and the outcome (page count, messages indexed,
+// server-reported total) at Info, so an unexpectedly shallow scan can be told
+// apart from a genuine end-of-history by reading the log.
 func (c *Client) ScanOwn(ctx context.Context, g Group, cb func(msgID int, date time.Time)) error {
 	api, err := c.apiRef()
 	if err != nil {
 		return err
 	}
-	offsetID := 0
+	var offsetID, pages, indexed int
 	for {
 		res, err := api.MessagesSearch(ctx, &tg.MessagesSearchRequest{
 			Peer:     g.inputPeer(),
 			FromID:   &tg.InputPeerSelf{},
 			Filter:   &tg.InputMessagesFilterEmpty{},
-			Limit:    100,
+			Limit:    searchPageLimit,
 			OffsetID: offsetID,
 		})
 		if err != nil {
 			return err
 		}
 		msgs := messagesOf(res)
-		if len(msgs) == 0 {
-			return nil
-		}
-		last := 0
+		serverCount := searchTotal(res)
+		pages++
+
+		var counted, minID int
 		for _, mc := range msgs {
 			m, ok := mc.(*tg.Message)
 			if !ok {
-				continue
+				continue // service message: still counts towards the offset below
 			}
 			cb(m.ID, time.Unix(int64(m.Date), 0))
-			last = m.ID
+			counted++
+			if minID == 0 || m.ID < minID {
+				minID = m.ID
+			}
 		}
-		if last == 0 || last == offsetID {
+		indexed += counted
+
+		c.log.Debug("own-message scan page",
+			zap.String("title", g.Title),
+			zap.Int("page", pages),
+			zap.Int("offset_id", offsetID),
+			zap.Int("returned", len(msgs)),
+			zap.Int("counted", counted),
+			zap.Int("page_min_id", minID),
+			zap.Int("server_count", serverCount),
+			zap.Int("indexed", indexed),
+		)
+
+		// End of history: the server returned nothing, or a page with no real
+		// messages, or it will not move the offset any further back.
+		if len(msgs) == 0 || minID == 0 || minID == offsetID {
+			lvl := c.log.Info
+			reason := "end of history"
+			if serverCount > 0 && indexed < serverCount {
+				lvl = c.log.Warn
+				reason = "stopped before server-reported total"
+			}
+			lvl("own-message scan finished",
+				zap.String("title", g.Title),
+				zap.String("reason", reason),
+				zap.Int("pages", pages),
+				zap.Int("indexed", indexed),
+				zap.Int("server_count", serverCount),
+				zap.Int("last_offset_id", offsetID),
+				zap.Int("last_page_returned", len(msgs)),
+			)
 			return nil
 		}
-		offsetID = last
+		offsetID = minID
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -592,6 +636,22 @@ func (c *Client) MessageLink(g Group, msgID int) string {
 		return "https://t.me/" + g.Username + "/" + strconv.Itoa(msgID)
 	}
 	return "https://t.me/c/" + strconv.FormatInt(g.rawID, 10) + "/" + strconv.Itoa(msgID)
+}
+
+// searchTotal reports the server's total match count for a messages.search
+// response. MessagesMessages carries the whole result set in one page and has
+// no separate counter, so its length is the total. Unknown types report -1.
+func searchTotal(res tg.MessagesMessagesClass) int {
+	switch v := res.(type) {
+	case *tg.MessagesMessages:
+		return len(v.Messages)
+	case *tg.MessagesMessagesSlice:
+		return v.Count
+	case *tg.MessagesChannelMessages:
+		return v.Count
+	default:
+		return -1
+	}
 }
 
 func messagesOf(res tg.MessagesMessagesClass) []tg.MessageClass {
