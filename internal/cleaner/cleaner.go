@@ -27,6 +27,15 @@ const sweepInterval = time.Second
 // purgeLinkLimit caps how many failed-message deeplinks a purge report carries.
 const purgeLinkLimit = 10
 
+// maxDrainPasses is the absolute cap on drainChat iterations for one chat, a
+// backstop so the loop can never run forever even if every other termination
+// check fails to fire.
+const maxDrainPasses = 50
+
+// drainPassDelay is the pause between drainChat passes, on top of the per-page
+// pacing inside ScanOwn, so the RPC burst stays gentle on the account.
+const drainPassDelay = 5 * time.Second
+
 // TG is the subset of the MTProto client the cleaner needs.
 type TG interface {
 	ResolveGroups(ctx context.Context) ([]tgclient.Group, error)
@@ -68,6 +77,10 @@ type Cleaner struct {
 
 	loopMu  sync.Mutex
 	looping bool
+
+	// drainPause is the wait between drainChat passes; a field so tests can
+	// zero it. New sets it to drainPassDelay.
+	drainPause time.Duration
 }
 
 // New creates a Cleaner.
@@ -76,11 +89,12 @@ func New(tg TG, cfg *chatcfg.Store, log *zap.Logger) *Cleaner {
 		log = zap.NewNop()
 	}
 	return &Cleaner{
-		tg:      tg,
-		cfg:     cfg,
-		log:     log,
-		index:   make(map[int64]map[int]time.Time),
-		deleted: make(map[int64]int),
+		tg:         tg,
+		cfg:        cfg,
+		log:        log,
+		index:      make(map[int64]map[int]time.Time),
+		deleted:    make(map[int64]int),
+		drainPause: drainPassDelay,
 	}
 }
 
@@ -161,6 +175,12 @@ func (c *Cleaner) OnOwnMessage(markedID int64, msgID int, date time.Time, text s
 	if cfg.TTLMinutes <= 0 {
 		return
 	}
+	c.indexMessage(markedID, msgID, date)
+}
+
+// indexMessage records msgID under markedID with its send time, creating the
+// per-chat map on first use.
+func (c *Cleaner) indexMessage(markedID int64, msgID int, date time.Time) {
 	c.mu.Lock()
 	m := c.index[markedID]
 	if m == nil {
@@ -205,29 +225,31 @@ func (c *Cleaner) removeLocked(markedID int64, ids []int) {
 	}
 }
 
+// resolveGroup returns the cached group for markedID, refreshing the group
+// cache once if it is not yet known.
+func (c *Cleaner) resolveGroup(ctx context.Context, markedID int64) (tgclient.Group, error) {
+	if g, ok := c.tg.Group(markedID); ok {
+		return g, nil
+	}
+	if _, err := c.tg.ResolveGroups(ctx); err != nil {
+		return tgclient.Group{}, err
+	}
+	if g, ok := c.tg.Group(markedID); ok {
+		return g, nil
+	}
+	return tgclient.Group{}, errUnknownGroup
+}
+
 // EnableChat performs the paced startup scan for a chat with TTL>0, filling the
 // index with the account's existing messages.
 func (c *Cleaner) EnableChat(ctx context.Context, markedID int64) error {
-	g, ok := c.tg.Group(markedID)
-	if !ok {
-		if _, err := c.tg.ResolveGroups(ctx); err != nil {
-			return err
-		}
-		g, ok = c.tg.Group(markedID)
-		if !ok {
-			return errUnknownGroup
-		}
+	g, err := c.resolveGroup(ctx, markedID)
+	if err != nil {
+		return err
 	}
 	c.log.Info("scanning own messages", zap.Int64("chat", markedID), zap.String("title", g.Title))
 	return c.tg.ScanOwn(ctx, g, func(msgID int, date time.Time) {
-		c.mu.Lock()
-		m := c.index[markedID]
-		if m == nil {
-			m = make(map[int]time.Time)
-			c.index[markedID] = m
-		}
-		m[msgID] = date
-		c.mu.Unlock()
+		c.indexMessage(markedID, msgID, date)
 	})
 }
 
@@ -247,33 +269,113 @@ func (c *Cleaner) Reset() {
 	c.mu.Unlock()
 }
 
-// PurgeNow scans and deletes every own message in the chat older than its TTL,
-// right away, and returns a summary.
+// PurgeNow deletes every reachable own message in the chat older than its TTL,
+// walking the whole history in paced passes, and returns a combined summary.
 func (c *Cleaner) PurgeNow(ctx context.Context, markedID int64) (Report, error) {
-	g, ok := c.tg.Group(markedID)
-	if !ok {
-		if _, err := c.tg.ResolveGroups(ctx); err != nil {
-			return Report{}, err
-		}
-		g, ok = c.tg.Group(markedID)
-		if !ok {
-			return Report{}, errUnknownGroup
-		}
+	return c.drainChat(ctx, markedID)
+}
+
+// drainChat repeatedly scans the chat's own messages and deletes those older
+// than its TTL, one messages.search window at a time.
+//
+// Telegram's from-self search only exposes the newest ~10k messages that
+// currently exist, so a single pass can delete at most that layer; each further
+// pass then sees the layer underneath. The loop stops when a pass finds nothing
+// left to delete, when the search window stops receding (nothing older is
+// reachable), when a pass deletes nothing despite finding candidates
+// (persistent delete failures), or after maxDrainPasses as a hard backstop.
+//
+// Every message seen is added to the in-memory index so ongoing TTL sweeping
+// keeps working afterwards. The returned Report aggregates all passes.
+func (c *Cleaner) drainChat(ctx context.Context, markedID int64) (Report, error) {
+	g, err := c.resolveGroup(ctx, markedID)
+	if err != nil {
+		return Report{}, err
 	}
+	rep := Report{Title: g.Title}
 	ttl := c.cfg.Get(markedID).TTL()
 	if ttl <= 0 {
-		return Report{Title: g.Title}, nil
+		return rep, nil
 	}
-	now := time.Now()
-	var ids []int
-	if err := c.tg.ScanOwn(ctx, g, func(msgID int, date time.Time) {
-		if now.Sub(date) >= ttl {
-			ids = append(ids, msgID)
+
+	prevOldest := 0
+	for pass := 1; pass <= maxDrainPasses; pass++ {
+		if err := ctx.Err(); err != nil {
+			return rep, err
 		}
-	}); err != nil {
-		return Report{Title: g.Title}, err
+
+		now := time.Now()
+		var (
+			expired []int
+			oldest  int
+		)
+		if err := c.tg.ScanOwn(ctx, g, func(msgID int, date time.Time) {
+			c.indexMessage(markedID, msgID, date)
+			if oldest == 0 || msgID < oldest {
+				oldest = msgID
+			}
+			if now.Sub(date) >= ttl {
+				expired = append(expired, msgID)
+			}
+		}); err != nil {
+			return rep, err
+		}
+
+		if len(expired) == 0 {
+			c.log.Info("history drain complete",
+				zap.Int64("chat", markedID), zap.String("title", g.Title),
+				zap.Int("passes", pass-1), zap.Int("deleted_total", rep.Deleted))
+			return rep, nil
+		}
+
+		pr := c.deleteIDs(ctx, markedID, expired)
+		mergeReport(&rep, pr)
+		c.log.Info("history drain pass",
+			zap.Int64("chat", markedID), zap.String("title", g.Title),
+			zap.Int("pass", pass), zap.Int("expired_found", len(expired)),
+			zap.Int("deleted", pr.Deleted), zap.Int("failed", pr.Failed),
+			zap.Int("oldest_id", oldest), zap.Int("deleted_total", rep.Deleted))
+
+		if pr.Deleted == 0 {
+			c.log.Warn("history drain stopped: pass deleted nothing",
+				zap.Int64("chat", markedID), zap.String("title", g.Title),
+				zap.Int("pass", pass), zap.Int("failed", pr.Failed))
+			return rep, nil
+		}
+		if prevOldest != 0 && oldest >= prevOldest {
+			c.log.Warn("history drain stopped: search window not receding",
+				zap.Int64("chat", markedID), zap.String("title", g.Title),
+				zap.Int("pass", pass), zap.Int("oldest_id", oldest),
+				zap.Int("prev_oldest_id", prevOldest))
+			return rep, nil
+		}
+		prevOldest = oldest
+
+		if c.drainPause > 0 {
+			select {
+			case <-ctx.Done():
+				return rep, ctx.Err()
+			case <-time.After(c.drainPause):
+			}
+		}
 	}
-	return c.deleteIDs(ctx, markedID, ids), nil
+
+	c.log.Warn("history drain stopped: pass ceiling reached",
+		zap.Int64("chat", markedID), zap.String("title", g.Title),
+		zap.Int("passes", maxDrainPasses), zap.Int("deleted_total", rep.Deleted))
+	return rep, nil
+}
+
+// mergeReport folds src into dst, keeping at most purgeLinkLimit links.
+func mergeReport(dst *Report, src Report) {
+	dst.Deleted += src.Deleted
+	dst.Failed += src.Failed
+	for _, l := range src.Links {
+		if len(dst.Links) >= purgeLinkLimit {
+			break
+		}
+		dst.Links = append(dst.Links, l)
+	}
 }
 
 // deleteIDs deletes ids from the chat, updates counters and the index, and

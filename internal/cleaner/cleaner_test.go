@@ -28,6 +28,17 @@ type fakeTG struct {
 	pending  map[int64]tgclient.Group // revealed by ResolveGroups
 	resolves int
 	link     bool // when true, MessageLink returns a non-empty string
+
+	// scanWindow, when > 0, caps how many not-yet-deleted messages ScanOwn
+	// hands back per call, mimicking Telegram's ~10k from-self search ceiling:
+	// deleting the visible layer reveals the one beneath it on the next call.
+	scanWindow int
+	scanCalls  int
+	// scanGen, when set, synthesises the messages for a group on demand from
+	// the call count, for histories too deep to enumerate up front. A scanGen
+	// group is a raw script: the already-deleted filter and scanWindow do not
+	// apply to it, so it can model a server that keeps re-serving the same ids.
+	scanGen map[int64]func(call int) []scanMsg
 }
 
 func newFakeTG() *fakeTG {
@@ -37,7 +48,16 @@ func newFakeTG() *fakeTG {
 		deleted: map[int64][]int{},
 		failIDs: map[int]bool{},
 		pending: map[int64]tgclient.Group{},
+		scanGen: map[int64]func(int) []scanMsg{},
 	}
+}
+
+// newCleaner builds a Cleaner for tests with the inter-pass drain delay
+// disabled so drainChat runs without real sleeps.
+func newCleaner(tg TG, store *chatcfg.Store) *Cleaner {
+	c := New(tg, store, nil)
+	c.drainPause = 0
+	return c
 }
 
 func (f *fakeTG) ResolveGroups(context.Context) ([]tgclient.Group, error) {
@@ -61,8 +81,30 @@ func (f *fakeTG) Group(marked int64) (tgclient.Group, bool) {
 }
 
 func (f *fakeTG) ScanOwn(_ context.Context, g tgclient.Group, cb func(int, time.Time)) error {
-	for _, m := range f.scan[g.MarkedID] {
+	f.mu.Lock()
+	f.scanCalls++
+	call := f.scanCalls
+	gone := make(map[int]bool, len(f.deleted[g.MarkedID]))
+	for _, id := range f.deleted[g.MarkedID] {
+		gone[id] = true
+	}
+	msgs := f.scan[g.MarkedID]
+	window := f.scanWindow
+	raw := false
+	if gen := f.scanGen[g.MarkedID]; gen != nil {
+		msgs, window, raw = gen(call), 0, true
+	}
+	f.mu.Unlock()
+
+	n := 0
+	for _, m := range msgs {
+		if !raw && gone[m.id] {
+			continue
+		}
 		cb(m.id, m.date)
+		if n++; window > 0 && n >= window {
+			break
+		}
 	}
 	return nil
 }
@@ -117,7 +159,7 @@ func TestSweepDeletesExpired(t *testing.T) {
 	if err := store.SetTTL(chat, 1); err != nil {
 		t.Fatal(err)
 	}
-	c := New(f, store, nil)
+	c := newCleaner(f, store)
 
 	now := time.Now()
 	c.OnOwnMessage(chat, 10, now.Add(-2*time.Minute), "old")
@@ -145,7 +187,7 @@ func TestOnOwnMessageIgnoredWhenTTLZero(t *testing.T) {
 	const chat int64 = -100222
 	f := newFakeTG()
 	f.groups[chat] = tgclient.Group{MarkedID: chat}
-	c := New(f, newStore(t), nil)
+	c := newCleaner(f, newStore(t))
 
 	c.OnOwnMessage(chat, 1, time.Now(), "hi")
 
@@ -164,7 +206,7 @@ func TestOnOwnMessageInstantPatternNotIndexed(t *testing.T) {
 	store := newStore(t)
 	_ = store.SetTTL(chat, 60)
 	_ = store.AddPattern(chat, chatcfg.Pattern{Value: "/q", Exact: true})
-	c := New(f, store, nil)
+	c := newCleaner(f, store)
 
 	c.OnOwnMessage(chat, 7, time.Now(), "/q")
 
@@ -182,7 +224,7 @@ func TestOnDeletedRemovesFromIndex(t *testing.T) {
 	f.groups[chat] = tgclient.Group{MarkedID: chat}
 	store := newStore(t)
 	_ = store.SetTTL(chat, 60)
-	c := New(f, store, nil)
+	c := newCleaner(f, store)
 
 	c.OnOwnMessage(chat, 5, time.Now(), "keep")
 	c.OnDeleted(chat, []int{5})
@@ -205,7 +247,7 @@ func TestEnableChatFillsIndex(t *testing.T) {
 	}
 	store := newStore(t)
 	_ = store.SetTTL(chat, 30)
-	c := New(f, store, nil)
+	c := newCleaner(f, store)
 
 	if err := c.EnableChat(context.Background(), chat); err != nil {
 		t.Fatalf("EnableChat: %v", err)
@@ -228,7 +270,7 @@ func TestPurgeNowDeletesOldOnly(t *testing.T) {
 	}
 	store := newStore(t)
 	_ = store.SetTTL(chat, 60)
-	c := New(f, store, nil)
+	c := newCleaner(f, store)
 
 	rep, err := c.PurgeNow(context.Background(), chat)
 	if err != nil {
@@ -242,6 +284,136 @@ func TestPurgeNowDeletesOldOnly(t *testing.T) {
 	}
 }
 
+// descendingExpired builds n messages with ids n..1, all sent well before any
+// sane TTL, newest (largest id) first — the order messages.search returns.
+func descendingExpired(n int) []scanMsg {
+	old := time.Now().Add(-48 * time.Hour)
+	msgs := make([]scanMsg, 0, n)
+	for id := n; id >= 1; id-- {
+		msgs = append(msgs, scanMsg{id: id, date: old})
+	}
+	return msgs
+}
+
+func TestPurgeNowDrainsLayeredHistory(t *testing.T) {
+	const chat int64 = -101001
+	f := newFakeTG()
+	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "G", IsChannel: true}
+	f.scan[chat] = descendingExpired(250) // three search windows: 100 + 100 + 50
+	f.scanWindow = 100
+	f.link = true
+	f.failIDs[1], f.failIDs[2], f.failIDs[3] = true, true, true // stuck in the last window
+
+	store := newStore(t)
+	_ = store.SetTTL(chat, 60)
+	c := newCleaner(f, store)
+
+	rep, err := c.PurgeNow(context.Background(), chat)
+	if err != nil {
+		t.Fatalf("PurgeNow: %v", err)
+	}
+	// 247 deletable messages cleared across three delete passes; the fourth
+	// pass sees only the three stuck ids, deletes nothing, and stops the loop.
+	if rep.Deleted != 247 {
+		t.Errorf("rep.Deleted = %d, want 247", rep.Deleted)
+	}
+	if rep.Failed == 0 {
+		t.Errorf("rep.Failed = 0, want the stuck ids counted")
+	}
+	if len(rep.Links) > purgeLinkLimit {
+		t.Errorf("rep.Links = %d, want <= %d", len(rep.Links), purgeLinkLimit)
+	}
+	if got := len(f.deletedIDs(chat)); got != 247 {
+		t.Errorf("actually deleted %d, want 247", got)
+	}
+	if f.scanCalls != 4 {
+		t.Errorf("ScanOwn called %d times, want 4 (3 draining + 1 empty)", f.scanCalls)
+	}
+	// The three ids that could not be deleted stay indexed for the live sweep
+	// to retry; everything else is gone.
+	c.mu.Lock()
+	left := len(c.index[chat])
+	c.mu.Unlock()
+	if left != 3 {
+		t.Errorf("index holds %d messages, want 3 (the stuck ids)", left)
+	}
+}
+
+func TestPurgeNowStopsAtPassCeiling(t *testing.T) {
+	const chat int64 = -101002
+	f := newFakeTG()
+	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "G", IsChannel: true}
+	// A bottomless history: every scan yields one fresh, ever-older message, so
+	// the loop always makes progress and can only be stopped by the ceiling.
+	old := time.Now().Add(-48 * time.Hour)
+	f.scanGen[chat] = func(call int) []scanMsg {
+		return []scanMsg{{id: 1_000_000 - call, date: old}}
+	}
+	store := newStore(t)
+	_ = store.SetTTL(chat, 60)
+	c := newCleaner(f, store)
+
+	rep, err := c.PurgeNow(context.Background(), chat)
+	if err != nil {
+		t.Fatalf("PurgeNow: %v", err)
+	}
+	if rep.Deleted != maxDrainPasses {
+		t.Errorf("rep.Deleted = %d, want %d (one per pass)", rep.Deleted, maxDrainPasses)
+	}
+	if f.scanCalls != maxDrainPasses {
+		t.Errorf("ScanOwn called %d times, want %d", f.scanCalls, maxDrainPasses)
+	}
+}
+
+func TestPurgeNowStopsWhenWindowNotReceding(t *testing.T) {
+	const chat int64 = -101003
+	f := newFakeTG()
+	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "G", IsChannel: true}
+	old := time.Now().Add(-48 * time.Hour)
+	// The search floor never drops: call 1 reaches id 7, every later call stops
+	// at id 8. Passes keep deleting (ids are re-served), so the loop can only
+	// end via the "window not receding" guard.
+	f.scanGen[chat] = func(call int) []scanMsg {
+		if call == 1 {
+			return []scanMsg{{id: 10, date: old}, {id: 9, date: old}, {id: 8, date: old}, {id: 7, date: old}}
+		}
+		return []scanMsg{{id: 10, date: old}, {id: 9, date: old}, {id: 8, date: old}}
+	}
+	store := newStore(t)
+	_ = store.SetTTL(chat, 60)
+	c := newCleaner(f, store)
+
+	rep, err := c.PurgeNow(context.Background(), chat)
+	if err != nil {
+		t.Fatalf("PurgeNow: %v", err)
+	}
+	if f.scanCalls != 2 {
+		t.Errorf("ScanOwn called %d times, want 2 (guard trips on the second pass)", f.scanCalls)
+	}
+	if rep.Deleted != 7 { // 4 on pass one, 3 on pass two
+		t.Errorf("rep.Deleted = %d, want 7", rep.Deleted)
+	}
+}
+
+func TestPurgeNowNoTTLIsNoop(t *testing.T) {
+	const chat int64 = -101004
+	f := newFakeTG()
+	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "G", IsChannel: true}
+	f.scan[chat] = descendingExpired(10)
+	c := newCleaner(f, newStore(t)) // TTL unset
+
+	rep, err := c.PurgeNow(context.Background(), chat)
+	if err != nil {
+		t.Fatalf("PurgeNow: %v", err)
+	}
+	if rep.Deleted != 0 || f.scanCalls != 0 {
+		t.Fatalf("rep = %+v, scanCalls = %d, want no work", rep, f.scanCalls)
+	}
+	if rep.Title != "G" {
+		t.Errorf("rep.Title = %q, want the group title", rep.Title)
+	}
+}
+
 func TestOnDeletedCommonBox(t *testing.T) {
 	basic := tgclient.MarkChat(500)      // > -channelIDShift
 	channel := tgclient.MarkChannel(500) // < -channelIDShift
@@ -252,7 +424,7 @@ func TestOnDeletedCommonBox(t *testing.T) {
 	store := newStore(t)
 	_ = store.SetTTL(basic, 60)
 	_ = store.SetTTL(channel, 60)
-	c := New(f, store, nil)
+	c := newCleaner(f, store)
 
 	now := time.Now()
 	c.OnOwnMessage(basic, 7, now, "a")
@@ -282,7 +454,7 @@ func TestDeleteReportLinkCap(t *testing.T) {
 	for i := 1; i <= 15; i++ {
 		f.failIDs[i] = true
 	}
-	c := New(f, newStore(t), nil)
+	c := newCleaner(f, newStore(t))
 
 	ids := make([]int, 15)
 	for i := range ids {
@@ -304,7 +476,7 @@ func TestDeleteReportPartialFailure(t *testing.T) {
 	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "G", IsChannel: true}
 	f.failIDs[2] = true
 	f.failIDs[4] = true
-	c := New(f, newStore(t), nil)
+	c := newCleaner(f, newStore(t))
 
 	rep := c.deleteIDs(context.Background(), chat, []int{1, 2, 3, 4, 5})
 	if rep.Deleted != 3 || rep.Failed != 2 || len(rep.Links) != 2 {
@@ -325,7 +497,7 @@ func TestStats(t *testing.T) {
 	_ = store.SetTTL(a, 60)
 	_ = store.AddPattern(a, chatcfg.Pattern{Value: "/q", Exact: true})
 	_ = store.SetTTL(b, 30)
-	c := New(f, store, nil)
+	c := newCleaner(f, store)
 
 	now := time.Now()
 	c.OnOwnMessage(a, 1, now, "x")
@@ -352,7 +524,7 @@ func TestReset(t *testing.T) {
 	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "G", IsChannel: true}
 	store := newStore(t)
 	_ = store.SetTTL(chat, 60)
-	c := New(f, store, nil)
+	c := newCleaner(f, store)
 
 	c.OnOwnMessage(chat, 1, time.Now(), "x")
 	c.deleteIDs(context.Background(), chat, []int{1})
@@ -377,7 +549,7 @@ func TestSweepMultiChatDifferentTTL(t *testing.T) {
 	store := newStore(t)
 	_ = store.SetTTL(fast, 1)
 	_ = store.SetTTL(slow, 10)
-	c := New(f, store, nil)
+	c := newCleaner(f, store)
 
 	sent := time.Now().Add(-5 * time.Minute)
 	c.OnOwnMessage(fast, 1, sent, "x")
@@ -401,7 +573,7 @@ func TestEnableChatResolvesWhenMissing(t *testing.T) {
 	f.scan[chat] = []scanMsg{{id: 1, date: time.Now()}, {id: 2, date: time.Now()}}
 	store := newStore(t)
 	_ = store.SetTTL(chat, 30)
-	c := New(f, store, nil)
+	c := newCleaner(f, store)
 
 	if err := c.EnableChat(context.Background(), chat); err != nil {
 		t.Fatalf("EnableChat: %v", err)
