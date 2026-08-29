@@ -516,13 +516,28 @@ func (bt *Bot) finishPattern(kind string) {
 }
 
 func (bt *Bot) applyTTL(marked int64, minutes int) {
+	// A first activation (no TTL before) drains the whole reachable history in
+	// passes; changing an already-positive TTL only re-seeds the index.
+	firstEnable := minutes > 0 && bt.cfg.Get(marked).TTLMinutes <= 0
 	if err := bt.cfg.SetTTL(marked, minutes); err != nil {
 		bt.send("Set TTL failed: " + err.Error())
 		return
 	}
 	if minutes > 0 {
-		bt.send(fmt.Sprintf("TTL set to %d min for %s. Scanning history…", minutes, bt.groupTitle(marked)))
 		m := marked
+		if firstEnable {
+			bt.send(fmt.Sprintf("TTL set to %d min for %s. Cleaning history in passes, this can take a while…", minutes, bt.groupTitle(marked)))
+			go func() {
+				rep, err := bt.cl.PurgeNow(bt.baseCtx, m)
+				if err != nil {
+					bt.send("History cleanup failed: " + err.Error())
+					return
+				}
+				bt.send(formatReport("History cleanup", rep))
+			}()
+			return
+		}
+		bt.send(fmt.Sprintf("TTL set to %d min for %s. Scanning history…", minutes, bt.groupTitle(marked)))
 		go func() {
 			if err := bt.cl.EnableChat(bt.baseCtx, m); err != nil {
 				bt.send("History scan failed: " + err.Error())
