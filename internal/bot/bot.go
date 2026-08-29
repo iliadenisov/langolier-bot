@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -22,6 +23,15 @@ import (
 
 // groupsPerPage is the inline-keyboard page size for the chat picker.
 const groupsPerPage = 8
+
+// reconcileInterval is the fallback cadence for the membership reconcile; a
+// membership update pokes it sooner.
+const reconcileInterval = 10 * time.Minute
+
+// membershipCoalesce is how long the reconcile loop waits after a membership
+// poke so the burst of updates a single join or leave emits collapses into one
+// reconcile.
+const membershipCoalesce = 2 * time.Second
 
 type inputKind int
 
@@ -46,6 +56,8 @@ type Bot struct {
 
 	baseCtx context.Context
 
+	membershipPoke chan struct{}
+
 	mu        sync.Mutex
 	running   bool
 	pending   inputKind
@@ -59,7 +71,7 @@ func New(token string, ownerID int64, log *zap.Logger) (*Bot, error) {
 	if log == nil {
 		log = zap.NewNop()
 	}
-	bt := &Bot{log: log, ownerID: ownerID}
+	bt := &Bot{log: log, ownerID: ownerID, membershipPoke: make(chan struct{}, 1)}
 	b, err := bot.New(token, bot.WithDefaultHandler(bt.onUpdate))
 	if err != nil {
 		return nil, err
@@ -73,6 +85,16 @@ func (bt *Bot) Attach(tgc *tgclient.Client, cfg *chatcfg.Store, cl *cleaner.Clea
 	bt.tgc = tgc
 	bt.cfg = cfg
 	bt.cl = cl
+	tgc.OnMembership(bt.pokeMembership)
+}
+
+// pokeMembership asks the reconcile loop to run soon. Non-blocking: a poke
+// already queued is enough.
+func (bt *Bot) pokeMembership() {
+	select {
+	case bt.membershipPoke <- struct{}{}:
+	default:
+	}
 }
 
 // Start runs the bot until ctx is cancelled.
@@ -394,6 +416,58 @@ func (bt *Bot) onReady(ctx context.Context) {
 			}
 		}()
 	}
+	go bt.reconcileLoop(ctx)
+}
+
+// reconcileLoop keeps the cleaner's view of chat membership in sync: it runs on
+// a slow ticker and, sooner, whenever the MTProto client reports a membership
+// change. Pokes are coalesced so the burst from one join or leave triggers a
+// single reconcile.
+func (bt *Bot) reconcileLoop(ctx context.Context) {
+	t := time.NewTicker(reconcileInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		case <-bt.membershipPoke:
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(membershipCoalesce):
+			}
+			drainChan(bt.membershipPoke)
+		}
+		bt.runReconcile(ctx)
+	}
+}
+
+// drainChan empties a buffered channel without blocking.
+func drainChan(ch <-chan struct{}) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+// runReconcile reconciles membership once and reports the transitions to the
+// owner.
+func (bt *Bot) runReconcile(ctx context.Context) {
+	res, err := bt.cl.Reconcile(ctx)
+	if err != nil {
+		bt.log.Warn("membership reconcile", zap.Error(err))
+		return
+	}
+	for _, title := range res.Lost {
+		bt.send("Stopped cleaning " + title + " — the account left or was removed. Config kept; cleanup resumes on rejoin.")
+	}
+	for _, title := range res.Rejoined {
+		bt.send("Rejoined " + title + " — cleaning history in passes.")
+	}
 }
 
 func (bt *Bot) cmdStop() {
@@ -564,6 +638,14 @@ func (bt *Bot) runPurge(marked int64) {
 }
 
 func (bt *Bot) cmdStatus() {
+	// Refresh membership first so the listing reflects any recent leave/rejoin,
+	// but only while the user client is up (Reconcile needs a live connection).
+	bt.mu.Lock()
+	running := bt.running
+	bt.mu.Unlock()
+	if running {
+		bt.runReconcile(bt.baseCtx)
+	}
 	stats := bt.cl.Stats()
 	if len(stats) == 0 {
 		bt.send("No configured chats.")

@@ -2,6 +2,7 @@ package cleaner
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -20,14 +21,16 @@ type scanMsg struct {
 }
 
 type fakeTG struct {
-	mu       sync.Mutex
-	groups   map[int64]tgclient.Group
-	scan     map[int64][]scanMsg
-	deleted  map[int64][]int
-	failIDs  map[int]bool
-	pending  map[int64]tgclient.Group // revealed by ResolveGroups
-	resolves int
-	link     bool // when true, MessageLink returns a non-empty string
+	mu         sync.Mutex
+	groups     map[int64]tgclient.Group
+	scan       map[int64][]scanMsg
+	deleted    map[int64][]int
+	failIDs    map[int]bool
+	pending    map[int64]tgclient.Group // revealed by ResolveGroups
+	absent     map[int64]bool           // in groups, but ResolveGroups hides it (account left)
+	resolveErr error                    // when set, ResolveGroups fails with it
+	resolves   int
+	link       bool // when true, MessageLink returns a non-empty string
 
 	// scanWindow, when > 0, caps how many not-yet-deleted messages ScanOwn
 	// hands back per call, mimicking Telegram's ~10k from-self search ceiling:
@@ -48,6 +51,7 @@ func newFakeTG() *fakeTG {
 		deleted: map[int64][]int{},
 		failIDs: map[int]bool{},
 		pending: map[int64]tgclient.Group{},
+		absent:  map[int64]bool{},
 		scanGen: map[int64]func(int) []scanMsg{},
 	}
 }
@@ -62,14 +66,20 @@ func newCleaner(tg TG, store *chatcfg.Store) *Cleaner {
 
 func (f *fakeTG) ResolveGroups(context.Context) ([]tgclient.Group, error) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.resolves++
+	if f.resolveErr != nil {
+		return nil, f.resolveErr
+	}
 	for k, g := range f.pending {
 		f.groups[k] = g
 		delete(f.pending, k)
 	}
-	f.mu.Unlock()
 	out := make([]tgclient.Group, 0, len(f.groups))
 	for _, g := range f.groups {
+		if f.absent[g.MarkedID] {
+			continue
+		}
 		out = append(out, g)
 	}
 	return out, nil
@@ -586,5 +596,94 @@ func TestEnableChatResolvesWhenMissing(t *testing.T) {
 	c.mu.Unlock()
 	if n != 2 {
 		t.Errorf("indexed %d, want 2", n)
+	}
+}
+
+func TestReconcileStopsCleanupOnLeave(t *testing.T) {
+	const chat int64 = -102001
+	f := newFakeTG()
+	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "Gone", IsChannel: true}
+	store := newStore(t)
+	_ = store.SetTTL(chat, 60)
+	c := newCleaner(f, store)
+	c.OnOwnMessage(chat, 1, time.Now(), "x") // chat is now indexed
+
+	f.absent[chat] = true // the account has left / been removed
+
+	res, err := c.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(res.Lost) != 1 || res.Lost[0] != "Gone" {
+		t.Fatalf("Lost = %v, want [Gone]", res.Lost)
+	}
+	if len(res.Rejoined) != 0 {
+		t.Fatalf("Rejoined = %v, want none", res.Rejoined)
+	}
+	c.mu.Lock()
+	_, indexed := c.index[chat]
+	c.mu.Unlock()
+	if indexed {
+		t.Error("index not dropped for the left chat")
+	}
+	if store.Get(chat).TTLMinutes != 60 {
+		t.Error("TTL config wrongly cleared on leave")
+	}
+}
+
+func TestReconcileDrainsOnRejoin(t *testing.T) {
+	const chat int64 = -102002
+	f := newFakeTG()
+	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "Back", IsChannel: true}
+	store := newStore(t)
+	_ = store.SetTTL(chat, 60)
+	c := newCleaner(f, store)
+
+	var drained []int64
+	c.startDrain = func(m int64) { drained = append(drained, m) }
+
+	res, err := c.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(res.Rejoined) != 1 || res.Rejoined[0] != "Back" {
+		t.Fatalf("Rejoined = %v, want [Back]", res.Rejoined)
+	}
+	if len(res.Lost) != 0 {
+		t.Fatalf("Lost = %v, want none", res.Lost)
+	}
+	if len(drained) != 1 || drained[0] != chat {
+		t.Fatalf("startDrain calls = %v, want [%d]", drained, chat)
+	}
+}
+
+func TestReconcileNoopWhenActiveOrUnconfigured(t *testing.T) {
+	active := int64(-102003)
+	unconfigured := int64(-102004)
+	f := newFakeTG()
+	f.groups[active] = tgclient.Group{MarkedID: active, Title: "Active", IsChannel: true}
+	f.groups[unconfigured] = tgclient.Group{MarkedID: unconfigured, Title: "Off", IsChannel: true}
+	store := newStore(t)
+	_ = store.SetTTL(active, 60)
+	c := newCleaner(f, store)
+	c.startDrain = func(int64) { t.Fatal("startDrain called for an already-active chat") }
+	c.OnOwnMessage(active, 1, time.Now(), "x") // active is indexed
+
+	res, err := c.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(res.Lost) != 0 || len(res.Rejoined) != 0 {
+		t.Fatalf("res = %+v, want no transitions", res)
+	}
+}
+
+func TestReconcilePropagatesResolveError(t *testing.T) {
+	f := newFakeTG()
+	f.resolveErr = errors.New("boom")
+	c := newCleaner(f, newStore(t))
+
+	if _, err := c.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile returned nil, want the ResolveGroups error")
 	}
 }
