@@ -73,6 +73,7 @@ type Cleaner struct {
 	mu      sync.Mutex
 	index   map[int64]map[int]time.Time // markedID -> msgID -> send time
 	deleted map[int64]int               // markedID -> messages deleted this session
+	active  map[int64]struct{}          // markedID -> the cleaner is maintaining this chat
 
 	delMu sync.Mutex // serialises delete RPC bursts
 
@@ -99,6 +100,7 @@ func New(tg TG, cfg *chatcfg.Store, log *zap.Logger) *Cleaner {
 		log:        log,
 		index:      make(map[int64]map[int]time.Time),
 		deleted:    make(map[int64]int),
+		active:     make(map[int64]struct{}),
 		drainPause: drainPassDelay,
 	}
 	c.startDrain = func(markedID int64) {
@@ -254,6 +256,23 @@ func (c *Cleaner) resolveGroup(ctx context.Context, markedID int64) (tgclient.Gr
 	return tgclient.Group{}, errUnknownGroup
 }
 
+// markActive records that the cleaner is maintaining markedID: the account's
+// membership is confirmed and a scan or drain has been started for it. This is
+// tracked apart from the message index, which is empty whenever a chat has no
+// own messages awaiting deletion.
+func (c *Cleaner) markActive(markedID int64) {
+	c.mu.Lock()
+	c.active[markedID] = struct{}{}
+	c.mu.Unlock()
+}
+
+func (c *Cleaner) isActive(markedID int64) bool {
+	c.mu.Lock()
+	_, ok := c.active[markedID]
+	c.mu.Unlock()
+	return ok
+}
+
 // EnableChat performs the paced startup scan for a chat with TTL>0, filling the
 // index with the account's existing messages.
 func (c *Cleaner) EnableChat(ctx context.Context, markedID int64) error {
@@ -261,25 +280,30 @@ func (c *Cleaner) EnableChat(ctx context.Context, markedID int64) error {
 	if err != nil {
 		return err
 	}
+	c.markActive(markedID)
 	c.log.Info("scanning own messages", zap.Int64("chat", markedID), zap.String("title", g.Title))
 	return c.tg.ScanOwn(ctx, g, func(msgID int, date time.Time) {
 		c.indexMessage(markedID, msgID, date)
 	})
 }
 
-// DisableChat forgets a chat's index.
+// DisableChat stops maintaining a chat: it forgets the chat's index and its
+// active mark.
 func (c *Cleaner) DisableChat(markedID int64) {
 	c.mu.Lock()
 	delete(c.index, markedID)
+	delete(c.active, markedID)
 	c.mu.Unlock()
 }
 
-// Reset drops the whole in-memory index and per-session counters. Call it when
-// the user client stops so a later start re-scans from a clean slate.
+// Reset drops the whole in-memory index, active set and per-session counters.
+// Call it when the user client stops so a later start re-scans from a clean
+// slate.
 func (c *Cleaner) Reset() {
 	c.mu.Lock()
 	c.index = make(map[int64]map[int]time.Time)
 	c.deleted = make(map[int64]int)
+	c.active = make(map[int64]struct{})
 	c.mu.Unlock()
 }
 
@@ -291,14 +315,19 @@ type ReconcileResult struct {
 }
 
 // Reconcile compares the chats the account is actually in against the chats the
-// cleaner is watching (a positive TTL configured, or a live index) and acts on
-// the difference:
+// cleaner is maintaining and acts on the difference:
 //
-//   - a watched, indexed chat that is no longer in the dialog list means the
-//     account left or was removed: its sweep stops and its in-memory index is
-//     dropped, while the TTL and pattern config are kept for a later rejoin;
-//   - a chat the account is back in, still TTL-configured but not yet indexed,
-//     gets a fresh multi-pass history drain.
+//   - a chat the cleaner was maintaining that is no longer in the dialog list
+//     means the account left or was removed: its sweep stops and its in-memory
+//     index is dropped, while the TTL and pattern config are kept for a later
+//     rejoin;
+//   - a TTL-configured chat the account is in that the cleaner is not yet
+//     maintaining (a first join, or a rejoin after a loss) gets a fresh
+//     multi-pass history drain.
+//
+// Membership is tracked by the active set, not by the message index: an idle
+// chat that has simply been swept clean still counts as maintained and must not
+// be mistaken for a rejoin.
 //
 // It is safe to call repeatedly; only transitions produce entries in the
 // result.
@@ -319,7 +348,7 @@ func (c *Cleaner) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		}
 	}
 	c.mu.Lock()
-	for marked := range c.index {
+	for marked := range c.active {
 		watch[marked] = struct{}{}
 	}
 	c.mu.Unlock()
@@ -327,15 +356,14 @@ func (c *Cleaner) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	var res ReconcileResult
 	for marked := range watch {
 		_, here := present[marked]
-		c.mu.Lock()
-		_, indexed := c.index[marked]
-		c.mu.Unlock()
+		active := c.isActive(marked)
 
 		switch {
-		case !here && indexed:
+		case active && !here:
 			c.DisableChat(marked)
 			res.Lost = append(res.Lost, c.chatTitle(marked))
-		case here && !indexed && c.cfg.Get(marked).TTL() > 0:
+		case !active && here && c.cfg.Get(marked).TTL() > 0:
+			c.markActive(marked)
 			c.startDrain(marked)
 			res.Rejoined = append(res.Rejoined, c.chatTitle(marked))
 		}
@@ -382,6 +410,7 @@ func (c *Cleaner) drainChat(ctx context.Context, markedID int64) (Report, error)
 	if ttl <= 0 {
 		return rep, nil
 	}
+	c.markActive(markedID)
 
 	prevOldest := 0
 	for pass := 1; pass <= maxDrainPasses; pass++ {

@@ -603,10 +603,13 @@ func TestReconcileStopsCleanupOnLeave(t *testing.T) {
 	const chat int64 = -102001
 	f := newFakeTG()
 	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "Gone", IsChannel: true}
+	f.scan[chat] = []scanMsg{{id: 1, date: time.Now()}}
 	store := newStore(t)
 	_ = store.SetTTL(chat, 60)
 	c := newCleaner(f, store)
-	c.OnOwnMessage(chat, 1, time.Now(), "x") // chat is now indexed
+	if err := c.EnableChat(context.Background(), chat); err != nil { // now maintained
+		t.Fatalf("EnableChat: %v", err)
+	}
 
 	f.absent[chat] = true // the account has left / been removed
 
@@ -663,11 +666,14 @@ func TestReconcileNoopWhenActiveOrUnconfigured(t *testing.T) {
 	f := newFakeTG()
 	f.groups[active] = tgclient.Group{MarkedID: active, Title: "Active", IsChannel: true}
 	f.groups[unconfigured] = tgclient.Group{MarkedID: unconfigured, Title: "Off", IsChannel: true}
+	f.scan[active] = []scanMsg{{id: 1, date: time.Now()}}
 	store := newStore(t)
 	_ = store.SetTTL(active, 60)
 	c := newCleaner(f, store)
 	c.startDrain = func(int64) { t.Fatal("startDrain called for an already-active chat") }
-	c.OnOwnMessage(active, 1, time.Now(), "x") // active is indexed
+	if err := c.EnableChat(context.Background(), active); err != nil { // active is maintained
+		t.Fatalf("EnableChat: %v", err)
+	}
 
 	res, err := c.Reconcile(context.Background())
 	if err != nil {
@@ -685,5 +691,96 @@ func TestReconcilePropagatesResolveError(t *testing.T) {
 
 	if _, err := c.Reconcile(context.Background()); err == nil {
 		t.Fatal("Reconcile returned nil, want the ResolveGroups error")
+	}
+}
+
+func TestReconcileNoRejoinForIdleActiveChat(t *testing.T) {
+	const chat int64 = -102005
+	f := newFakeTG()
+	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "Idle", IsChannel: true}
+	f.scan[chat] = nil // the account is a member but has no own messages
+	store := newStore(t)
+	_ = store.SetTTL(chat, 60)
+	c := newCleaner(f, store)
+	c.startDrain = func(int64) { t.Fatal("startDrain called for a chat we never left") }
+
+	// Simulate the steady state: startup scan ran, found nothing to index.
+	if err := c.EnableChat(context.Background(), chat); err != nil {
+		t.Fatalf("EnableChat: %v", err)
+	}
+
+	res, err := c.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(res.Lost) != 0 || len(res.Rejoined) != 0 {
+		t.Fatalf("res = %+v, want no transitions for an idle chat we are still in", res)
+	}
+}
+
+func TestReconcileDetectsLeaveOfIdleChat(t *testing.T) {
+	const chat int64 = -102006
+	f := newFakeTG()
+	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "IdleGone", IsChannel: true}
+	f.scan[chat] = nil // maintained but nothing indexed
+	store := newStore(t)
+	_ = store.SetTTL(chat, 60)
+	c := newCleaner(f, store)
+	if err := c.EnableChat(context.Background(), chat); err != nil {
+		t.Fatalf("EnableChat: %v", err)
+	}
+
+	f.absent[chat] = true
+	res, err := c.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(res.Lost) != 1 || res.Lost[0] != "IdleGone" {
+		t.Fatalf("Lost = %v, want [IdleGone] (an idle chat leaving still counts)", res.Lost)
+	}
+	if c.isActive(chat) {
+		t.Error("chat still marked active after leave")
+	}
+}
+
+func TestReconcileRejoinAfterLoss(t *testing.T) {
+	const chat int64 = -102007
+	f := newFakeTG()
+	f.groups[chat] = tgclient.Group{MarkedID: chat, Title: "Cycle", IsChannel: true}
+	f.scan[chat] = []scanMsg{{id: 1, date: time.Now()}}
+	store := newStore(t)
+	_ = store.SetTTL(chat, 60)
+	c := newCleaner(f, store)
+	var drained []int64
+	c.startDrain = func(m int64) { drained = append(drained, m) }
+
+	if err := c.EnableChat(context.Background(), chat); err != nil {
+		t.Fatalf("EnableChat: %v", err)
+	}
+
+	// Leave.
+	f.absent[chat] = true
+	res, err := c.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile (leave): %v", err)
+	}
+	if len(res.Lost) != 1 || len(res.Rejoined) != 0 {
+		t.Fatalf("leave: res = %+v", res)
+	}
+
+	// Rejoin.
+	f.absent[chat] = false
+	res, err = c.Reconcile(context.Background())
+	if err != nil {
+		t.Fatalf("Reconcile (rejoin): %v", err)
+	}
+	if len(res.Rejoined) != 1 || res.Rejoined[0] != "Cycle" || len(res.Lost) != 0 {
+		t.Fatalf("rejoin: res = %+v", res)
+	}
+	if len(drained) != 1 || drained[0] != chat {
+		t.Fatalf("startDrain calls = %v, want [%d]", drained, chat)
+	}
+	if !c.isActive(chat) {
+		t.Error("chat not re-marked active after rejoin")
 	}
 }
