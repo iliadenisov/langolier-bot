@@ -186,6 +186,22 @@ func TestMessagesOf(t *testing.T) {
 	}
 }
 
+func TestSearchTotal(t *testing.T) {
+	m := []tg.MessageClass{&tg.Message{ID: 1}, &tg.Message{ID: 2}}
+	if got := searchTotal(&tg.MessagesMessages{Messages: m}); got != 2 {
+		t.Errorf("MessagesMessages: got %d, want 2", got)
+	}
+	if got := searchTotal(&tg.MessagesMessagesSlice{Count: 4200, Messages: m}); got != 4200 {
+		t.Errorf("MessagesMessagesSlice: got %d, want 4200", got)
+	}
+	if got := searchTotal(&tg.MessagesChannelMessages{Count: 99, Messages: m}); got != 99 {
+		t.Errorf("MessagesChannelMessages: got %d, want 99", got)
+	}
+	if got := searchTotal(&tg.MessagesMessagesNotModified{}); got != -1 {
+		t.Errorf("unknown type: got %d, want -1", got)
+	}
+}
+
 func TestOrDefault(t *testing.T) {
 	if orDefault("", "d") != "d" || orDefault("x", "d") != "x" {
 		t.Fail()
